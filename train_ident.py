@@ -28,7 +28,7 @@ def set_seed(seed):
 # configuration
 parser = ArgumentParser()
 parser.add_argument('-c', '--config', default='config/example.json')
-parser.add_argument('--seed', default=1234)
+parser.add_argument('--seed', default=42)
 args = parser.parse_args()
 config = Config.from_json_file(args.config)
 # print(config.to_dict())

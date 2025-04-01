@@ -3,11 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import time
-
-from torch.distributions import Dirichlet
-
 from graph import Graph
-from transformers import BertModel, AutoModel,AlbertModel,RobertaModel
+from transformers import BertModel, AutoModel, AlbertModel, RobertaModel
 from global_feature import generate_global_feature_vector, generate_global_feature_maps
 from util import normalize_score
 from opt_einsum import contract
@@ -17,8 +14,20 @@ from collections import Counter, namedtuple, defaultdict
 from data import Batch, Instance
 from torch.nn.parameter import Parameter
 from sparsemax import Sparsemax
+import traceback # 用于更详细的错误追踪
+from http import HTTPStatus
+import dashscope
+import math
+import json
+import numpy as np
+import requests
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
+API_KEY = ""
+MODEL_NAME = ''
+cur_dir = os.path.dirname(os.path.realpath(__file__))
+RELATION_EXISTS_VALUE = 1
+RELATION_ABSENT_VALUE = 1
 
 def log_sum_exp(tensor, dim=0, keepdim: bool = False):
     """LogSumExp operation used by CRF."""
@@ -97,6 +106,465 @@ def token_lens_to_idxs(token_lens):
         masks.append(seq_masks)
     return idxs, masks, max_token_num, max_token_len
 
+def validate_and_process_matrix(raw_matrix: list[list], expected_n: int) -> list[list[float]] | None:
+
+    if not isinstance(raw_matrix, list) or not all(isinstance(row, list) for row in raw_matrix):
+        print(f"Warning: Matrix is not a list of lists. Received: {type(raw_matrix)}. Skipping.")
+        return None
+
+    if not raw_matrix:
+         print(f"Warning: Received empty matrix list. Skipping.")
+         return None
+
+    n_rows = len(raw_matrix)
+    if n_rows == 0:
+        print(f"Warning: Received matrix with 0 rows. Skipping.")
+        return None
+
+
+    if n_rows != expected_n or not all(len(row) == expected_n for row in raw_matrix):
+        n_cols_actual = [len(row) for row in raw_matrix]
+        print(f"Warning: Matrix dimensions mismatch. Expected ({expected_n}x{expected_n}), Got rows={n_rows}, cols={n_cols_actual}. Skipping.")
+        return None
+
+    if expected_n < 1:
+         print(f"Warning: Expected dimension {expected_n} is less than 1. Returning empty list.")
+         return []
+    if expected_n == 1:
+
+        try:
+             val = float(raw_matrix[0][0])
+             if math.isclose(val, RELATION_ABSENT_VALUE):
+                 return [[RELATION_ABSENT_VALUE]]
+             else:
+                 print(f"Warning: 1x1 matrix diagonal value mismatch. Expected {RELATION_ABSENT_VALUE}, Got {val}. Correcting.")
+                 return [[RELATION_ABSENT_VALUE]]
+        except (ValueError, TypeError, IndexError):
+             print(f"Warning: Error processing 1x1 matrix value: {raw_matrix[0][0]}. Returning default.")
+             return [[RELATION_ABSENT_VALUE]]
+
+
+    processed_matrix = [[RELATION_ABSENT_VALUE] * expected_n for _ in range(expected_n)]
+    allowed_values = {RELATION_EXISTS_VALUE, RELATION_ABSENT_VALUE}
+    tolerance = 1e-6
+
+    try:
+        for r in range(expected_n):
+            for c in range(r + 1, expected_n):
+                val_rc_raw = raw_matrix[r][c]
+                val_cr_raw = raw_matrix[c][r]
+
+                val_rc = None
+                val_cr = None
+
+                try:
+                    temp_rc = float(val_rc_raw)
+                    if any(math.isclose(temp_rc, v, abs_tol=tolerance) for v in allowed_values):
+                        val_rc = RELATION_EXISTS_VALUE if math.isclose(temp_rc, RELATION_EXISTS_VALUE, abs_tol=tolerance) else RELATION_ABSENT_VALUE
+                except (ValueError, TypeError):
+                    pass
+
+                try:
+                    temp_cr = float(val_cr_raw)
+                    if any(math.isclose(temp_cr, v, abs_tol=tolerance) for v in allowed_values):
+                         val_cr = RELATION_EXISTS_VALUE if math.isclose(temp_cr, RELATION_EXISTS_VALUE, abs_tol=tolerance) else RELATION_ABSENT_VALUE
+                except (ValueError, TypeError):
+                    pass
+
+                rel = RELATION_ABSENT_VALUE
+
+                if val_rc is not None and val_cr is not None and not math.isclose(val_rc, val_cr, abs_tol=tolerance):
+                     print(f"Warning: Asymmetry detected at ({r},{c}) and ({c},{r}). Values: {val_rc_raw}, {val_cr_raw}. Prioritizing {RELATION_EXISTS_VALUE} if present.")
+                     if math.isclose(val_rc, RELATION_EXISTS_VALUE, abs_tol=tolerance) or math.isclose(val_cr, RELATION_EXISTS_VALUE, abs_tol=tolerance):
+                         rel = RELATION_EXISTS_VALUE
+                     else:
+                         rel = RELATION_ABSENT_VALUE
+
+                elif val_rc is not None and math.isclose(val_rc, RELATION_EXISTS_VALUE, abs_tol=tolerance):
+                    rel = RELATION_EXISTS_VALUE
+                elif val_cr is not None and math.isclose(val_cr, RELATION_EXISTS_VALUE, abs_tol=tolerance):
+                    rel = RELATION_EXISTS_VALUE
+
+                elif val_rc is None and val_cr is None:
+                     print(f"Warning: Invalid values at both ({r},{c}) and ({c},{r}). Values: {val_rc_raw}, {val_cr_raw}. Assuming relationship {RELATION_ABSENT_VALUE}.")
+                     rel = RELATION_ABSENT_VALUE
+
+                processed_matrix[r][c] = rel
+                processed_matrix[c][r] = rel
+
+
+        for i in range(expected_n):
+            processed_matrix[i][i] = RELATION_ABSENT_VALUE
+
+        return processed_matrix
+
+    except (IndexError, ValueError, TypeError) as e:
+        print(f"Warning: Error processing matrix element during validation: {e}. Returning None.")
+        traceback.print_exc()
+        return None
+    except Exception as e:
+        print(f"Warning: Unexpected error during matrix validation: {e}. Returning None.")
+        traceback.print_exc()
+        return None
+
+def _call_llm_for_semantic_matrices(
+    sentences: list[str],
+    entities_batch: list[list[str]],
+    triggers_batch: list[list[str]],
+    api_key: str = API_KEY,
+    model: str = MODEL_NAME
+) -> tuple[list[list | None], list[list | None]] | None:
+
+    batch_size = len(sentences)
+    if not (batch_size == len(entities_batch) == len(triggers_batch)):
+        print("Error: Input lists (sentences, entities, triggers) must have the same length.")
+        return None
+    if batch_size == 0:
+        print("Info: Input batch is empty.")
+        return [], []
+
+    formatted_batch_input = []
+    valid_indices_map = {}
+    items_to_process = []
+
+    for i in range(batch_size):
+        sentence = sentences[i]
+        entities = entities_batch[i]
+        triggers = triggers_batch[i]
+        entity_num = len(entities)
+        trigger_num = len(triggers)
+
+        needs_entity_matrix = entity_num >= 1
+        needs_trigger_matrix = trigger_num >= 1
+
+        if not needs_entity_matrix and not needs_trigger_matrix:
+            continue
+
+        current_llm_idx = len(items_to_process)
+        valid_indices_map[current_llm_idx] = i
+        items_to_process.append({
+            "original_index": i,
+            "sentence": sentence,
+            "entities": entities,
+            "triggers": triggers,
+            "entity_num": entity_num,
+            "trigger_num": trigger_num,
+            "needs_entity_matrix": needs_entity_matrix,
+            "needs_trigger_matrix": needs_trigger_matrix,
+            "meaningful_entity_rels": entity_num >= 2,
+            "meaningful_trigger_rels": trigger_num >= 2,
+        })
+
+        formatted_entities = "\n".join([f"{j+1}: {entity}" for j, entity in enumerate(entities)]) if entities else "None"
+        formatted_triggers = "\n".join([f"{j+1}: {trigger}" for j, trigger in enumerate(triggers)]) if triggers else "None"
+        entity_prompt_part = f"Entities ({entity_num}):\n{formatted_entities}\nGenerate H^sem_entity: {'Yes' if needs_entity_matrix else 'No'}"
+        trigger_prompt_part = f"Triggers ({trigger_num}):\n{formatted_triggers}\nGenerate H^sem_triggers: {'Yes' if needs_trigger_matrix else 'No'}"
+
+
+        formatted_batch_input.append(
+             f"--- Sentence {current_llm_idx + 1} (Original Index {i + 1}) ---\n"
+             f"Sentence:\n\"{sentence}\"\n\n"
+             f"{entity_prompt_part}\n\n"
+             f"{trigger_prompt_part}"
+         )
+
+    if not items_to_process:
+        print("Info: No sentences in the batch require any matrix generation (all have 0 entities and 0 triggers).")
+        return [[] for _ in range(batch_size)], [[] for _ in range(batch_size)]
+
+    combined_input_for_prompt = "\n\n".join(formatted_batch_input)
+    num_items_for_llm = len(items_to_process)
+
+    system_prompt = (
+        "You are an expert in information extraction and relationship analysis. "
+        "Your task is to identify semantic relationships between entities and between triggers found in multiple sentences. "
+        f"For each of the {num_items_for_llm} sentences provided below, output a SINGLE JSON object containing 'entity_matrices' and 'trigger_matrices'. "
+        "Each value must be a list containing results for *all* provided sentences in order. "
+        "Generate an entity adjacency matrix (H^sem_entity) if the sentence has 1 or more entities. "
+        "Generate a trigger adjacency matrix (H^sem_triggers) if the sentence has 1 or more triggers. "
+        f"Use an empty list `[]` ONLY if a sentence has 0 entities/triggers respectively. "
+        f"Each generated matrix must be square and symmetric. "
+        f"Use the value {RELATION_EXISTS_VALUE} if item i+1 and item j+1 (i != j) are semantically related based *only* on the sentence content. "
+        f"Use the value {RELATION_ABSENT_VALUE} if item i+1 and item j+1 (i != j) are NOT semantically related. "
+        f"The diagonal elements (i == j) MUST always be {RELATION_ABSENT_VALUE}. "
+        f"Ensure all values are floats ({RELATION_EXISTS_VALUE} or {RELATION_ABSENT_VALUE}). "
+        "Output ONLY the raw JSON object without explanations or markdown."
+    )
+
+    user_prompt = f"""
+Analyze the following batch of {num_items_for_llm} sentences:
+
+{combined_input_for_prompt}
+
+Output a single JSON object according to the system prompt instructions. The lists "entity_matrices" and "trigger_matrices" must each contain exactly {num_items_for_llm} elements (using `[]` only if 0 items).
+
+Example structure for 2 sentences requested (S1: 2 entities, 1 trigger; S2: 3 entities, 0 triggers):
+{{
+  "entity_matrices": [
+    [[{RELATION_ABSENT_VALUE}, {RELATION_EXISTS_VALUE}], [{RELATION_EXISTS_VALUE}, {RELATION_ABSENT_VALUE}]],
+    [[{RELATION_ABSENT_VALUE}, {RELATION_EXISTS_VALUE}, {RELATION_ABSENT_VALUE}], [{RELATION_EXISTS_VALUE}, {RELATION_ABSENT_VALUE}, {RELATION_ABSENT_VALUE}], [{RELATION_ABSENT_VALUE}, {RELATION_ABSENT_VALUE}, {RELATION_ABSENT_VALUE}]]
+  ],
+  "trigger_matrices": [
+    [[{RELATION_ABSENT_VALUE}]],
+    []
+  ]
+}}
+"""
+    messages = [{'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt}]
+
+    llm_output_str = None
+    try:
+        # Note: Make sure API_KEY and model are correctly set
+        response = dashscope.Generation.call(
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            result_format='message',
+            stream=False,
+            temperature=0.0 # Lower temperature for more deterministic output
+        )
+
+        if response.status_code == HTTPStatus.OK:
+            llm_output_str = response.output.choices[0].message.content.strip()
+            if not llm_output_str:
+                print("Error: LLM returned an empty response.")
+                return None
+            # Clean markdown
+            if llm_output_str.startswith("```json"): llm_output_str = llm_output_str[len("```json"):].strip()
+            elif llm_output_str.startswith("```"): llm_output_str = llm_output_str[len("```"):].strip()
+            if llm_output_str.endswith("```"): llm_output_str = llm_output_str[:-len("```")].strip()
+        else:
+            print(f'--- LLM API Request Failed --- Status: {response.status_code}, Code: {response.code}, Msg: {response.message}')
+            return None
+    except Exception as e:
+        print(f"--- Error during API call ---")
+        print(f"An error occurred: {e}")
+        traceback.print_exc()
+        return None
+
+
+    final_entity_matrices = [None] * batch_size
+    final_trigger_matrices = [None] * batch_size
+
+    try:
+        raw_output_data = json.loads(llm_output_str)
+        if not isinstance(raw_output_data, dict) or "entity_matrices" not in raw_output_data or "trigger_matrices" not in raw_output_data:
+             print(f"Error: LLM output JSON structure is invalid. Missing required keys.")
+             print(f"LLM Output (after cleaning): '{llm_output_str}'")
+             return None
+        entity_matrices_llm = raw_output_data["entity_matrices"]
+        trigger_matrices_llm = raw_output_data["trigger_matrices"]
+        if not isinstance(entity_matrices_llm, list) or not isinstance(trigger_matrices_llm, list):
+             print("Error: 'entity_matrices' or 'trigger_matrices' in LLM JSON is not a list.")
+             return None
+        if len(entity_matrices_llm) != num_items_for_llm or len(trigger_matrices_llm) != num_items_for_llm:
+             print(f"Error: LLM returned lists of incorrect length. Expected {num_items_for_llm}, Got {len(entity_matrices_llm)} entities, {len(trigger_matrices_llm)} triggers.")
+             # Attempt to proceed might be risky, depends on how strict you need to be
+             # return None
+
+
+        for llm_idx in range(num_items_for_llm):
+            if llm_idx >= len(entity_matrices_llm) or llm_idx >= len(trigger_matrices_llm):
+                 print(f"Warning: LLM output list index {llm_idx} out of bounds due to length mismatch. Skipping.")
+                 continue
+
+            original_idx = valid_indices_map[llm_idx]
+            item_info = items_to_process[llm_idx]
+
+            raw_entity_matrix_llm = entity_matrices_llm[llm_idx]
+            if item_info["needs_entity_matrix"]:
+                 # Expect list from LLM if needs_matrix is True
+                 if isinstance(raw_entity_matrix_llm, list) and raw_entity_matrix_llm:
+                     validated_entity_matrix = validate_and_process_matrix(raw_entity_matrix_llm, item_info["entity_num"])
+                     if validated_entity_matrix is not None: # validate returns list[list[float]] or None
+                          final_entity_matrices[original_idx] = validated_entity_matrix
+                     else: # Validation failed
+                          print(f"Info: Validation failed for entity matrix of original sentence {original_idx + 1}. Storing None temporarily.")
+                          final_entity_matrices[original_idx] = None # Mark failure
+                 elif isinstance(raw_entity_matrix_llm, list) and not raw_entity_matrix_llm and item_info["entity_num"] > 0 :
+                      # LLM returned [] when it should have returned NxN matrix
+                      print(f"Warning: LLM returned empty list '[]' for entity matrix of original sentence {original_idx + 1} (expected {item_info['entity_num']}x{item_info['entity_num']}). Storing None.")
+                      final_entity_matrices[original_idx] = None
+                 elif item_info["entity_num"] == 0 and isinstance(raw_entity_matrix_llm, list) and not raw_entity_matrix_llm:
+                      # Correct case: 0 entities, LLM returned []
+                      final_entity_matrices[original_idx] = [] # Store []
+                 else: # LLM provided something unexpected (not list, or wrong empty list case)
+                      print(f"Warning: Received unexpected data type or format for entity matrix of original sentence {original_idx + 1}. Type: {type(raw_entity_matrix_llm)}. Storing None.")
+                      final_entity_matrices[original_idx] = None
+            else: # Does not need entity matrix (entity_num == 0)
+                 if isinstance(raw_entity_matrix_llm, list) and not raw_entity_matrix_llm:
+                      final_entity_matrices[original_idx] = [] # Store [] as expected
+                 else:
+                      print(f"Warning: Expected empty list [] for entity matrix of original sentence {original_idx + 1} (0 entities), but got: {raw_entity_matrix_llm}. Storing [].")
+                      final_entity_matrices[original_idx] = []
+
+            # --- 处理触发词矩阵 (不变) ---
+            raw_trigger_matrix_llm = trigger_matrices_llm[llm_idx]
+            if item_info["needs_trigger_matrix"]:
+                if isinstance(raw_trigger_matrix_llm, list) and raw_trigger_matrix_llm:
+                     validated_trigger_matrix = validate_and_process_matrix(raw_trigger_matrix_llm, item_info["trigger_num"])
+                     if validated_trigger_matrix is not None:
+                          final_trigger_matrices[original_idx] = validated_trigger_matrix
+                     else:
+                          print(f"Info: Validation failed for trigger matrix of original sentence {original_idx + 1}. Storing None temporarily.")
+                          final_trigger_matrices[original_idx] = None
+                elif isinstance(raw_trigger_matrix_llm, list) and not raw_trigger_matrix_llm and item_info["trigger_num"] > 0:
+                     print(f"Warning: LLM returned empty list '[]' for trigger matrix of original sentence {original_idx + 1} (expected {item_info['trigger_num']}x{item_info['trigger_num']}). Storing None.")
+                     final_trigger_matrices[original_idx] = None
+                elif item_info["trigger_num"] == 0 and isinstance(raw_trigger_matrix_llm, list) and not raw_trigger_matrix_llm:
+                     final_trigger_matrices[original_idx] = [] # Store []
+                else:
+                     print(f"Warning: Received unexpected data type or format for trigger matrix of original sentence {original_idx + 1}. Type: {type(raw_trigger_matrix_llm)}. Storing None.")
+                     final_trigger_matrices[original_idx] = None
+            else: # Does not need trigger matrix (trigger_num == 0)
+                 if isinstance(raw_trigger_matrix_llm, list) and not raw_trigger_matrix_llm:
+                      final_trigger_matrices[original_idx] = [] # Store [] as expected
+                 else:
+                      print(f"Warning: Expected empty list [] for trigger matrix of original sentence {original_idx + 1} (0 triggers), but got: {raw_trigger_matrix_llm}. Storing [].")
+                      final_trigger_matrices[original_idx] = []
+
+
+        # Fill results for sentences never sent to LLM (0 entities AND 0 triggers)
+        processed_indices = {item['original_index'] for item in items_to_process}
+        for i in range(batch_size):
+            if i not in processed_indices:
+                 final_entity_matrices[i] = []
+                 final_trigger_matrices[i] = []
+
+        # Replace Nones (validation failures or unexpected LLM output) with empty lists []
+        # This simplifies padding later - empty lists won't be padded.
+        final_entity_matrices = [m if m is not None else [] for m in final_entity_matrices]
+        final_trigger_matrices = [m if m is not None else [] for m in final_trigger_matrices]
+
+        return final_entity_matrices, final_trigger_matrices
+
+    except json.JSONDecodeError as e:
+        print(f"Error: Failed to decode JSON from LLM output: {e}")
+        print(f"LLM Output was (after cleaning): '{llm_output_str}'")
+        return None
+    except Exception as e:
+        print(f"Error: An unexpected error occurred during LLM result processing: {e}")
+        traceback.print_exc()
+        return None
+
+
+def get_semantic_matrices_batch(
+    sentences_per_batch: list[str],
+    entities_per_batch: list[list[str]],
+    triggers_per_batch: list[list[str]],
+    max_entity_num: int | None = None, # sentence_max_num for entities
+    max_trigger_num: int | None = None, # sentence_max_num for triggers
+    api_key: str = API_KEY,
+    model: str = MODEL_NAME
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+
+    batch_size = len(sentences_per_batch)
+    if batch_size == 0:
+        print("Info: Empty batch provided to get_semantic_matrices_batch.")
+
+        final_max_entity = max_entity_num if max_entity_num is not None else 0
+        final_max_trigger = max_trigger_num if max_trigger_num is not None else 0
+        return np.full((0, final_max_entity, final_max_entity), fill_value=1.0, dtype=float), \
+               np.full((0, final_max_trigger, final_max_trigger), fill_value=1.0, dtype=float)
+
+    llm_result = _call_llm_for_semantic_matrices(
+        sentences_per_batch, entities_per_batch, triggers_per_batch, api_key, model
+    )
+
+    if llm_result is None:
+        print("Error: Failed to get results from LLM helper function.")
+        return None, None
+
+    entity_matrices_list, trigger_matrices_list = llm_result
+    # entity_matrices_list[i] is now list[list[float]] or []
+
+    if max_entity_num is None:
+        calculated_max_entity = max(len(ents) for ents in entities_per_batch) if entities_per_batch else 0
+        determined_max_entity = max(0, calculated_max_entity)
+    else:
+        determined_max_entity = max(0, max_entity_num)
+        actual_max_in_batch_entity = max(len(ents) for ents in entities_per_batch) if entities_per_batch else 0
+        if actual_max_in_batch_entity > determined_max_entity:
+            print(f"Warning: Actual max entities in batch ({actual_max_in_batch_entity}) exceeds provided max_entity_num ({determined_max_entity}). Matrices might be truncated.")
+
+    if max_trigger_num is None:
+        calculated_max_trigger = max(len(trigs) for trigs in triggers_per_batch) if triggers_per_batch else 0
+        determined_max_trigger = max(0, calculated_max_trigger)
+    else:
+        determined_max_trigger = max(0, max_trigger_num)
+        actual_max_in_batch_trigger = max(len(trigs) for trigs in triggers_per_batch) if triggers_per_batch else 0
+        if actual_max_in_batch_trigger > determined_max_trigger:
+             print(f"Warning: Actual max triggers in batch ({actual_max_in_batch_trigger}) exceeds provided max_trigger_num ({determined_max_trigger}). Matrices might be truncated.")
+
+
+
+    H_entity_sem = np.full((batch_size, determined_max_entity, determined_max_entity),
+                           fill_value=1.0, dtype=float)
+    H_trigger_sem = np.full((batch_size, determined_max_trigger, determined_max_trigger),
+                            fill_value=1.0, dtype=float)
+
+    for i in range(batch_size):
+
+        entity_matrix = entity_matrices_list[i] # list[list[float]] or []
+        if isinstance(entity_matrix, list) and entity_matrix:
+            n = len(entity_matrix)
+            copy_n = min(n, determined_max_entity)
+            if n > determined_max_entity:
+                 print(f"Warning: Entity matrix for sentence {i+1} (dim {n}) is larger than target dimension ({determined_max_entity}). Truncating.")
+
+            if copy_n > 0:
+                 try:
+                     H_entity_sem[i, :copy_n, :copy_n] = np.array(entity_matrix, dtype=float)[:copy_n, :copy_n]
+                 except ValueError as e:
+                      print(f"Error setting entity matrix slice for sentence {i+1}: {e}. Matrix was: {entity_matrix}")
+
+        trigger_matrix = trigger_matrices_list[i]
+        if isinstance(trigger_matrix, list) and trigger_matrix:
+            m = len(trigger_matrix)
+            copy_m = min(m, determined_max_trigger)
+            if m > determined_max_trigger:
+                 print(f"Warning: Trigger matrix for sentence {i+1} (dim {m}) is larger than target dimension ({determined_max_trigger}). Truncating.")
+
+            if copy_m > 0:
+                 try:
+                      H_trigger_sem[i, :copy_m, :copy_m] = np.array(trigger_matrix, dtype=float)[:copy_m, :copy_m]
+                 except ValueError as e:
+                      print(f"Error setting trigger matrix slice for sentence {i+1}: {e}. Matrix was: {trigger_matrix}")
+
+    return H_entity_sem, H_trigger_sem
+
+def graph_to_node_sentences(batch, graph):
+    sentences_per_batch = []
+    batch_tokens = batch.tokens
+
+    for i, sentence_words in enumerate(batch_tokens):
+        sentences_per_batch.append(" ".join(sentence_words))
+
+    entities_per_batch = []
+    triggers_per_batch = []
+
+    for i, graph in enumerate(batch.graphs):
+        entities = []
+        for entity in graph.entities:
+            start_idx = entity[0]
+            end_idx = entity[1]
+            entity_type = entity[2]
+            entity_text = " ".join(batch_tokens[i][start_idx:end_idx + 1])
+            entities.append(entity_text)
+        entities_per_batch.append(entities)
+
+        triggers = []
+        for trigger in graph.triggers:
+            start_idx = trigger[0]
+            end_idx = trigger[1]
+            trigger_type = trigger[2]
+            trigger_text = " ".join(batch_tokens[i][start_idx:end_idx + 1])
+            triggers.append(trigger_text)
+        triggers_per_batch.append(triggers)
+
+    return sentences_per_batch, entities_per_batch, triggers_per_batch
+
 
 def graphs_to_node_idxs(graphs):
     """
@@ -105,7 +573,7 @@ def graphs_to_node_idxs(graphs):
     """
     entity_idxs, entity_masks = [], []
     trigger_idxs, trigger_masks = [], []
-    # 
+    #
     max_entity_num = max(max(graph.entity_num for graph in graphs), 1)
     max_trigger_num = max(max(graph.trigger_num for graph in graphs), 1)
     max_entity_len = max(max([e[1] - e[0] for e in graph.entities] + [1])
@@ -275,7 +743,7 @@ def remove_overlap_entities(gold_entities, wrong_entities):
         #         continue
         # entities_.append(entity)
         for i in range(start, end):
-            # 
+            #
             tokens[i] = 1
     for wrong_entity in wrong_entities:
         start, end = wrong_entity[0], wrong_entity[1]
@@ -291,6 +759,7 @@ def remove_overlap_entities(gold_entities, wrong_entities):
 
 class High_Linears(nn.Module):
     """Multiple linear layers with Dropout."""
+
     def __init__(self, dimensions, dropout_prob=0.0, bias=True):
         super().__init__()
         assert len(dimensions) > 1
@@ -307,10 +776,12 @@ class High_Linears(nn.Module):
             inputs = layer(inputs)
         return inputs
 
-#==============================================================================
+
+# ==============================================================================
 class Guide_Linears(nn.Module):
     """Multiple linear layers with Dropout."""
-    def __init__(self, dimensions, activation='relu', dropout_prob=0.0, bias=True):
+
+    def __init__(self, dimensions, activation='prelu', dropout_prob=0.0, bias=True):
         super().__init__()
         assert len(dimensions) > 1
         self.layers = nn.ModuleList([nn.Linear(dimensions[i], dimensions[i + 1], bias=bias)
@@ -324,23 +795,77 @@ class Guide_Linears(nn.Module):
             inputs = self.activation(inputs)
             inputs = self.dropout(inputs)
         return inputs
-#==============================================================================
+
+
+# ==============================================================================
+
+class SwiGLU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, bias=True):
+        super().__init__()
+        self.w1 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.w2 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, output_dim, bias=bias)
+        self.swish = nn.SiLU()
+
+    def forward(self, x):
+        gate = self.swish(self.w1(x))
+        value = self.w2(x)
+        swi_glu = gate * value
+        output = self.w3(swi_glu)
+        return output
+
+
+class LinearsWithSwiGLU(nn.Module):
+    """Multiple linear layers with SwiGLU and Dropout."""
+
+    def __init__(self, dimensions, use_swiglu=True, activation='prelu', dropout_prob=0.0, bias=True):
+        super().__init__()
+        assert len(dimensions) > 1
+        self.layers = nn.ModuleList([])
+        self.use_swiglu = use_swiglu
+
+        for i in range(len(dimensions) - 1):
+            if i == 0 and use_swiglu:
+                hidden_dim = dimensions[i + 1] * 2
+                layer = SwiGLU(dimensions[i], hidden_dim, dimensions[i + 1], bias=bias)
+            else:
+                layer = nn.Linear(dimensions[i], dimensions[i + 1], bias=bias)
+            self.layers.append(layer)
+
+        if activation == "":
+            self.activation = None
+        elif activation == "GELU":
+            self.activation = nn.GELU()
+        else:
+            self.activation = getattr(torch, activation)
+
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, inputs):
+        for i, layer in enumerate(self.layers):
+            if i > 0:
+                if self.activation and not (i == 1 and self.use_swiglu):
+                    inputs = self.activation(inputs)
+                inputs = self.dropout(inputs)
+            inputs = layer(inputs)
+        return inputs
 
 
 class Linears(nn.Module):
     """Multiple linear layers with Dropout."""
-    def __init__(self, dimensions, activation='relu', dropout_prob=0.0, bias=True):
+
+    def __init__(self, dimensions, activation='prelu', dropout_prob=0.0, bias=True):
         super().__init__()
         assert len(dimensions) > 1
         self.layers = nn.ModuleList([nn.Linear(dimensions[i], dimensions[i + 1], bias=bias)
                                      for i in range(len(dimensions) - 1)])
         if activation == "":
-            self.activation = None 
+            self.activation = None
         elif activation == "GELU":
             self.activation = nn.GELU()
-        else:  
+        else:
             self.activation = getattr(torch, activation)
-        
+
         # self.activation = nn.LeakyReLU(0.1)
         self.dropout = nn.Dropout(dropout_prob)
 
@@ -353,6 +878,31 @@ class Linears(nn.Module):
                 inputs = self.dropout(inputs)
             inputs = layer(inputs)
         return inputs
+
+
+class ContinuousDynamicalPositionEncoding(nn.Module):
+    def __init__(self,d_model, max_len=512):
+        super(ContinuousDynamicalPositionEncoding, self).__init__()
+
+        self.d_model = d_model
+        self.max_len = max_len
+
+        self.position_dynamics = nn.Sequential(
+            nn.Linear(1, 128),
+            nn.ReLU(),
+            nn.Linear(128, d_model)
+        )
+
+        self.position_ids = torch.arange(0, max_len).float().unsqueeze(1)
+
+    def forward(self, input_tensor):
+        seq_len = input_tensor.size(1)
+
+        position_ids = self.position_ids[:seq_len, :]
+
+        position_embeddings = self.position_dynamics(position_ids.to('cuda:0'))
+
+        return position_embeddings.unsqueeze(0).expand(input_tensor.size(0), -1, -1)
 
 
 class CRF(nn.Module):
@@ -479,7 +1029,7 @@ class CRF(nn.Module):
         # end.record()
         # torch.cuda.synchronize()
         # print(start.elapsed_time(end))
-        # 
+        #
         return unary_score + binary_score
 
     def calc_norm_score(self, logits, lens):
@@ -514,7 +1064,7 @@ class CRF(nn.Module):
         # end.record()
         # torch.cuda.synchronize()
         # print(start.elapsed_time(end))
-        # 
+        #
         return norm
 
     def loglik(self, logits, labels, lens):
@@ -594,18 +1144,18 @@ class CRF(nn.Module):
 
 
 class OneIE(nn.Module):
-   
-   
+
     def __init__(self,
                  config,
                  vocabs,
-                 valid_patterns=None, guidelines = None,):
+                 valid_patterns=None, guidelines=None, ):
         super().__init__()
 
         self.test_potential = []
 
         # jointly training identification and classification or splitly training
         self.split_train = config.split_train
+
 
         # vocabularies
         self.config = config
@@ -617,15 +1167,8 @@ class OneIE(nn.Module):
         self.event_type_stoi = vocabs['event_type']
         self.relation_type_stoi = vocabs['relation_type']
         self.role_type_stoi = vocabs['role_type']
-        print("entity_label_stoi:", self.entity_label_stoi)
-        print("trigger_label_stoi:", self.trigger_label_stoi)
-        print("mention_type_stoi:", self.mention_type_stoi)
-        print("entity_type_stoi:", self.entity_type_stoi)
-        print("event_type_stoi:", self.event_type_stoi)
-        print("relation_type_stoi:", self.relation_type_stoi)
-        print("role_type_stoi:", self.role_type_stoi)
-        self.entity_label_itos = {i:s for s, i in self.entity_label_stoi.items()}
-        self.trigger_label_itos = {i:s for s, i in self.trigger_label_stoi.items()}
+        self.entity_label_itos = {i: s for s, i in self.entity_label_stoi.items()}
+        self.trigger_label_itos = {i: s for s, i in self.trigger_label_stoi.items()}
         self.entity_type_itos = {i: s for s, i in self.entity_type_stoi.items()}
         self.event_type_itos = {i: s for s, i in self.event_type_stoi.items()}
         self.relation_type_itos = {i: s for s, i in self.relation_type_stoi.items()}
@@ -652,7 +1195,7 @@ class OneIE(nn.Module):
             # ------------------------------------------------------------------------------
             # if config.use_high_order_tre:
             #     self.tre_valid_pattern_mask = self.event_role_entity_factor_mask()
-                # 
+            #
             # ------------------------------------------------------------------------------
         self.relation_directional = config.relation_directional
         self.symmetric_relations = config.symmetric_relations
@@ -694,9 +1237,9 @@ class OneIE(nn.Module):
 
         # self.entity_layer_norm = nn.LayerNorm(self.bert_dim)
         self.entity_label_ffn = nn.Linear(self.bert_dim, self.entity_label_num,
-                                        bias=linear_bias)
+                                          bias=linear_bias)
         self.trigger_label_ffn = nn.Linear(self.bert_dim, self.trigger_label_num,
-                                         bias=linear_bias)
+                                           bias=linear_bias)
 
         try:
             self.entity_hidden_size = config.entity_hidden_size
@@ -706,44 +1249,49 @@ class OneIE(nn.Module):
         if self.config.new_score:
             self.unary_entity_type_reps = Parameter(torch.empty(self.entity_type_num, entity_hidden_num))
             torch.nn.init.kaiming_uniform_(self.unary_entity_type_reps, a=math.sqrt(5))
-            self.entity_type_ffn = nn.Linear(self.bert_dim, entity_hidden_num)
+            # self.entity_type_ffn = nn.Linear(self.bert_dim, entity_hidden_num)
+            self.entity_type_ffn = LinearsWithSwiGLU([self.bert_dim, entity_hidden_num])
+            self.entity_typr_position_encoder = ContinuousDynamicalPositionEncoding(entity_hidden_num)
             self.linear_entity_dropout = nn.Dropout(p=config.linear_dropout)
         else:
             self.entity_type_ffn = Linears([self.bert_dim, entity_hidden_num,
-                                        self.entity_type_num],
-                                       dropout_prob=linear_dropout,
-                                       bias=linear_bias,
-                                       activation=config.linear_activation)
+                                            self.entity_type_num],
+                                           dropout_prob=linear_dropout,
+                                           bias=linear_bias,
+                                           activation=config.linear_activation)
         self.mention_type_ffn = Linears([self.bert_dim, mention_hidden_num,
                                          self.mention_type_num],
                                         dropout_prob=linear_dropout,
                                         bias=linear_bias,
                                         activation=config.linear_activation)
-        #===============================================================================================
+        # ===============================================================================================
         if self.config.new_score:
             self.unary_trigger_type_reps = Parameter(torch.empty(self.event_type_num, event_hidden_num))
             torch.nn.init.kaiming_uniform_(self.unary_trigger_type_reps, a=math.sqrt(5))
-            self.event_type_ffn = nn.Linear(self.bert_dim, event_hidden_num)
+            # self.event_type_ffn = nn.Linear(self.bert_dim, event_hidden_num)
+            self.event_type_ffn = LinearsWithSwiGLU([self.bert_dim, event_hidden_num])
+            self.event_typr_position_encoder = ContinuousDynamicalPositionEncoding(event_hidden_num)
             self.linear_trigger_dropout = nn.Dropout(p=config.linear_dropout)
         else:
             self.event_type_ffn = Linears([self.bert_dim, event_hidden_num,
-                                       self.event_type_num],
-                                      dropout_prob=linear_dropout,
-                                      bias=linear_bias,
-                                      activation=config.linear_activation)
-        #===============================================================================================
-        self.start_entity_ffn = nn.Linear(self.bert_dim, self.entity_hidden_size)
-        self.end_entity_ffn = nn.Linear(self.bert_dim, self.entity_hidden_size)
-        
+                                           self.event_type_num],
+                                          dropout_prob=linear_dropout,
+                                          bias=linear_bias,
+                                          activation=config.linear_activation)
+        # ===============================================================================================
+        # self.start_entity_ffn = nn.Linear(self.bert_dim, self.entity_hidden_size)
+        # self.end_entity_ffn = nn.Linear(self.bert_dim, self.entity_hidden_size)
+
+        self.start_entity_ffn = LinearsWithSwiGLU([self.bert_dim, self.entity_hidden_size])
+        self.end_entity_ffn = LinearsWithSwiGLU([self.bert_dim, self.entity_hidden_size])
+
         if config.split_rel_ident:
             self.start_entity_ident_ffn = nn.Linear(self.bert_dim, self.bert_dim)
             self.end_entity_ident_ffn = nn.Linear(self.bert_dim, self.bert_dim)
-            self.relation_ident_ffn = Linears([self.binary_dim, relation_hidden_num,2],
-                                         dropout_prob=linear_dropout,
-                                         bias=linear_bias,
-                                         activation=config.linear_activation)
-        
-
+            self.relation_ident_ffn = Linears([self.binary_dim, relation_hidden_num, 2],
+                                              dropout_prob=linear_dropout,
+                                              bias=linear_bias,
+                                              activation=config.linear_activation)
 
         if self.config.new_score:
             self.unary_relation_type_reps = Parameter(torch.empty(self.relation_type_num, self.entity_hidden_size))
@@ -752,54 +1300,56 @@ class OneIE(nn.Module):
             self.linear_end_dropout = nn.Dropout(p=config.linear_dropout)
         else:
             self.relation_type_ffn = Linears([self.binary_dim, relation_hidden_num,
-                                          self.relation_type_num],
-                                         dropout_prob=linear_dropout,
-                                         bias=linear_bias,
-                                         activation=config.linear_activation)
-        #===============================================================================
+                                              self.relation_type_num],
+                                             dropout_prob=linear_dropout,
+                                             bias=linear_bias,
+                                             activation=config.linear_activation)
+        # ===============================================================================
         self.use_guideliens = config.use_guideliens
         self.relation_type_reprs = None
         if config.use_guideliens:
             self.guideline_piexs = torch.tensor(guidelines['piece_idx'])
             self.guideline_attn_masks = torch.tensor(guidelines['attn_mask'])
             self.entity_ffn = Guide_Linears([self.binary_dim, relation_hidden_num],
-                                                dropout_prob=linear_dropout,
-                                                bias=linear_bias,
-                                                activation=config.linear_activation)
+                                            dropout_prob=linear_dropout,
+                                            bias=linear_bias,
+                                            activation=config.linear_activation)
             self.relation_ffn = Guide_Linears([self.bert_dim, relation_hidden_num],
-                                                dropout_prob=linear_dropout,
-                                                bias=linear_bias,
-                                                activation=config.linear_activation)
-        #===============================================================================
-        
+                                              dropout_prob=linear_dropout,
+                                              bias=linear_bias,
+                                              activation=config.linear_activation)
+        # ===============================================================================
+
         if self.config.new_score:
             self.unary_role_type_reps = Parameter(torch.empty(self.role_type_num, role_hidden_num))
             torch.nn.init.kaiming_uniform_(self.unary_role_type_reps, a=math.sqrt(5))
-            self.unary_trigger_ffn = nn.Linear(self.bert_dim, role_hidden_num)
+            # self.unary_trigger_ffn = nn.Linear(self.bert_dim, role_hidden_num)
+            self.unary_trigger_ffn = LinearsWithSwiGLU([self.bert_dim, role_hidden_num])
             argument_dim = self.bert_dim + (self.entity_type_num if self.use_entity_type else 0)
-            self.unary_argument_ffn = nn.Linear(argument_dim, role_hidden_num)
+            # self.unary_argument_ffn = nn.Linear(argument_dim, role_hidden_num)
+            self.unary_argument_ffn = LinearsWithSwiGLU([argument_dim, role_hidden_num])
             self.unary_trigger_dropout = nn.Dropout(p=config.linear_dropout)
             self.unary_argument_dropout = nn.Dropout(p=config.linear_dropout)
 
         else:
             self.role_type_ffn = Linears([role_input_dim, role_hidden_num,
-                                      self.role_type_num],
-                                     dropout_prob=linear_dropout,
-                                     bias=linear_bias,
-                                     activation=config.linear_activation)
+                                          self.role_type_num],
+                                         dropout_prob=linear_dropout,
+                                         bias=linear_bias,
+                                         activation=config.linear_activation)
         # global features
         self.use_global_features = config.use_global_features
-        #------------------------------------------------------------------------------
+        # ------------------------------------------------------------------------------
         if self.use_global_features:
             self.global_features = config.global_features
             self.global_feature_maps = generate_global_feature_maps(vocabs, valid_patterns)
             self.global_feature_num = sum(len(m) for k, m in self.global_feature_maps.items()
                                           if k in self.global_features or
                                           not self.global_features)
-            # 
+            #
             self.global_feature_weights = nn.Parameter(
                 torch.zeros(self.global_feature_num).fill_(-0.0001))
-        #------------------------------------------------------------------------------
+        # ------------------------------------------------------------------------------
 
         # decoder
         self.beam_size = config.beam_size
@@ -837,11 +1387,11 @@ class OneIE(nn.Module):
         self.tre_decomp_size = config.tre_decomp_size
         if self.use_high_order_tl:
             self.trigger_tl_W = High_Linears([self.bert_dim, event_hidden_num,
-                                       self.decomp_size],dropout_prob=linear_dropout,
-                                       bias=linear_bias)
+                                              self.decomp_size], dropout_prob=linear_dropout,
+                                             bias=linear_bias)
             self.entity_tl_W = High_Linears([self.bert_dim, event_hidden_num,
-                                       self.decomp_size],dropout_prob=linear_dropout,
-                                       bias=linear_bias)
+                                             self.decomp_size], dropout_prob=linear_dropout,
+                                            bias=linear_bias)
             # self.trigger_tl_W = nn.Linear(self.bert_dim, self.decomp_size,bias=False)
             # self.entity_tl_W = nn.Linear(self.bert_dim, self.decomp_size, bias=False)
             self.event_type_tl_W = Parameter(torch.empty(self.event_type_num, self.decomp_size))
@@ -855,11 +1405,11 @@ class OneIE(nn.Module):
                 torch.nn.init.kaiming_uniform_(self.role_entity_potential, a=math.sqrt(5))
             else:
                 self.trigger_le_W = High_Linears([self.bert_dim, event_hidden_num,
-                                        self.decomp_size],dropout_prob=linear_dropout,
-                                        bias=linear_bias)
+                                                  self.decomp_size], dropout_prob=linear_dropout,
+                                                 bias=linear_bias)
                 self.entity_le_W = High_Linears([self.bert_dim, event_hidden_num,
-                                        self.decomp_size],dropout_prob=linear_dropout,
-                                        bias=linear_bias)
+                                                 self.decomp_size], dropout_prob=linear_dropout,
+                                                bias=linear_bias)
                 # self.trigger_le_W = nn.Linear(self.bert_dim, self.decomp_size,bias=False)
                 # self.entity_le_W = nn.Linear(self.bert_dim, self.decomp_size, bias=False)
                 self.role_type_le_W = Parameter(torch.empty(self.role_type_num, self.decomp_size))
@@ -868,92 +1418,97 @@ class OneIE(nn.Module):
                 torch.nn.init.kaiming_uniform_(self.entity_type_le_W, a=math.sqrt(5))
         if self.use_high_order_tre:
             if self.config.new_potential:
-                self.event_role_entity_potential = Parameter(torch.empty(self.event_type_num, self.role_type_num, self.entity_type_num))
+                self.event_role_entity_potential = Parameter(
+                    torch.empty(self.event_type_num, self.role_type_num, self.entity_type_num))
                 # torch.nn.init.uniform_(self.event_role_entity_potential, a=0,b=1)
                 torch.nn.init.kaiming_uniform_(self.event_role_entity_potential, a=math.sqrt(5))
             else:
-                self.trigger_tre_W = nn.Linear(self.bert_dim, self.tre_decomp_size,bias=True)
+                self.trigger_tre_W = nn.Linear(self.bert_dim, self.tre_decomp_size, bias=True)
                 self.trigger_tre_dropout = nn.Dropout(p=config.linear_dropout)
-                self.entity_tre_W = nn.Linear(self.bert_dim, self.tre_decomp_size,bias=True)
+                self.entity_tre_W = nn.Linear(self.bert_dim, self.tre_decomp_size, bias=True)
                 self.entity_tre_dropout = nn.Dropout(p=config.linear_dropout)
-                self.event_type_W = Parameter(torch.empty(self.event_type_num-1, self.tre_decomp_size))
+                self.event_type_W = Parameter(torch.empty(self.event_type_num - 1, self.tre_decomp_size))
                 self.role_type_W = Parameter(torch.empty(self.role_type_num, self.tre_decomp_size))
-                self.entity_type_W = Parameter(torch.empty(self.entity_type_num-1, self.tre_decomp_size))
+                self.entity_type_W = Parameter(torch.empty(self.entity_type_num - 1, self.tre_decomp_size))
                 torch.nn.init.kaiming_uniform_(self.event_type_W, a=math.sqrt(5))
                 torch.nn.init.kaiming_uniform_(self.role_type_W, a=math.sqrt(5))
                 torch.nn.init.kaiming_uniform_(self.entity_type_W, a=math.sqrt(5))
         if self.use_high_order_sibling:
-            self.trigger_sib_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+            self.trigger_sib_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
             self.trigger_sib_dropout = nn.Dropout(p=config.linear_dropout)
-            self.entity_sib_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+            self.entity_sib_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
             self.entity_sib_dropout = nn.Dropout(p=config.linear_dropout)
             self.role_type_sib_W = Parameter(torch.empty(self.role_type_num, self.decomp_size))
             torch.nn.init.kaiming_uniform_(self.role_type_sib_W, a=math.sqrt(5))
         if self.use_high_order_coparent:
-            self.trigger_cop_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+            self.trigger_cop_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
             self.trigger_cop_dropout = nn.Dropout(p=config.linear_dropout)
-            self.entity_cop_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+            self.entity_cop_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
             self.entity_cop_dropout = nn.Dropout(p=config.linear_dropout)
             self.role_type_cop_W = Parameter(torch.empty(self.role_type_num, self.decomp_size))
             torch.nn.init.kaiming_uniform_(self.role_type_cop_W, a=math.sqrt(5))
-        
+
         if self.use_high_order_ere:
             if self.config.new_potential:
                 if self.config.share_relation_type_reps:
                     self.relation_type_ere_W = nn.Linear(self.entity_hidden_size, self.decomp_size, bias=True)
                     self.entity_type_ere_W = nn.Linear(entity_hidden_num, self.decomp_size, bias=True)
                 else:
-                    self.entity_type_ere_W = Parameter(torch.empty(self.entity_type_num-1, self.decomp_size))
+                    self.entity_type_ere_W = Parameter(torch.empty(self.entity_type_num - 1, self.decomp_size))
                     self.relation_type_ere_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                     torch.nn.init.kaiming_uniform_(self.entity_type_ere_W, a=math.sqrt(5))
                     torch.nn.init.kaiming_uniform_(self.relation_type_ere_W, a=math.sqrt(5))
             else:
-                self.entity_start_ere_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
-                self.entity_end_ere_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+                self.entity_start_ere_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
+                self.entity_end_ere_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
                 self.ere_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.ere_end_dropout = nn.Dropout(p=config.linear_dropout)
                 if self.config.share_relation_type_reps:
                     self.relation_type_ere_W = nn.Linear(self.entity_hidden_size, self.decomp_size, bias=True)
                     self.entity_type_ere_W = nn.Linear(entity_hidden_num, self.decomp_size, bias=True)
                 else:
-                    self.entity_type_ere_W = Parameter(torch.empty(self.entity_type_num-1, self.decomp_size))
+                    self.entity_type_ere_W = Parameter(torch.empty(self.entity_type_num - 1, self.decomp_size))
                     self.relation_type_ere_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                     torch.nn.init.kaiming_uniform_(self.entity_type_ere_W, a=math.sqrt(5))
                     torch.nn.init.kaiming_uniform_(self.relation_type_ere_W, a=math.sqrt(5))
-        
+
         if self.use_high_order_er:
             if self.config.new_potential:
-                self.entity_relation_potential = Parameter(torch.empty(self.entity_type_num-1, self.relation_type_num))
-                self.relation_entity_potential = Parameter(torch.empty(self.relation_type_num, self.entity_type_num-1))
+                self.entity_relation_potential = Parameter(
+                    torch.empty(self.entity_type_num - 1, self.relation_type_num))
+                self.relation_entity_potential = Parameter(
+                    torch.empty(self.relation_type_num, self.entity_type_num - 1))
                 torch.nn.init.kaiming_uniform_(self.entity_relation_potential, a=math.sqrt(5))
                 torch.nn.init.kaiming_uniform_(self.relation_entity_potential, a=math.sqrt(5))
             else:
-                self.start_entity_er_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
-                self.end_entity_er_W = nn.Linear(self.bert_dim, self.decomp_size,bias=True)
+                self.start_entity_er_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
+                self.end_entity_er_W = nn.Linear(self.bert_dim, self.decomp_size, bias=True)
                 self.er_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.er_end_dropout = nn.Dropout(p=config.linear_dropout)
-                self.entity_type_er_W = Parameter(torch.empty(self.entity_type_num-1, self.decomp_size))
+                self.entity_type_er_W = Parameter(torch.empty(self.entity_type_num - 1, self.decomp_size))
                 if self.config.share_relation_type_reps:
                     self.relation_type_er_W = nn.Linear(self.entity_hidden_size, self.decomp_size, bias=True)
                 else:
                     self.relation_type_er_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                     # self.er_rel_type_dropout = nn.Dropout(p=config.linear_dropout)
                     torch.nn.init.kaiming_uniform_(self.relation_type_er_W, a=math.sqrt(5))
-                torch.nn.init.kaiming_uniform_(self.entity_type_er_W, a=math.sqrt(5))           
-        
+                torch.nn.init.kaiming_uniform_(self.entity_type_er_W, a=math.sqrt(5))
+
         if self.use_high_order_re_sibling:
 
             if self.config.decomp:
-                self.entity_start_re_sib_W = nn.Linear(self.bert_dim, self.config.entity_hidden_size,bias=True)
-                self.entity_end_re_sib_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
+                self.entity_start_re_sib_W = nn.Linear(self.bert_dim, self.config.entity_hidden_size, bias=True)
+                self.entity_end_re_sib_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
                 self.sib_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.sib_end_dropout = nn.Dropout(p=config.linear_dropout)
-                
-                self.entity_start_re_sib_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
-                self.entity_end_re_sib_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
+
+                self.entity_start_re_sib_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                                bias=False)
+                self.entity_end_re_sib_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                              bias=False)
             else:
-                self.entity_start_re_sib_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-                self.entity_end_re_sib_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
+                self.entity_start_re_sib_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+                self.entity_end_re_sib_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
                 self.sib_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.sib_end_dropout = nn.Dropout(p=config.linear_dropout)
 
@@ -962,23 +1517,25 @@ class OneIE(nn.Module):
             else:
                 self.relation_type_re_sib_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                 torch.nn.init.kaiming_uniform_(self.relation_type_re_sib_W, a=math.sqrt(5))
-                #---------------------------------------------------------------------------
+                # ---------------------------------------------------------------------------
                 # self.relation_type_sib_dropout = nn.Dropout(p=config.linear_dropout)
-                #---------------------------------------------------------------------------
-        
+                # ---------------------------------------------------------------------------
+
         if self.use_high_order_re_coparent:
 
             if self.config.decomp:
-                self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
-                self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
+                self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
+                self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
                 self.cop_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.cop_end_dropout = nn.Dropout(p=config.linear_dropout)
 
-                self.entity_start_re_cop_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
-                self.entity_end_re_cop_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
+                self.entity_start_re_cop_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                                bias=False)
+                self.entity_end_re_cop_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                              bias=False)
             else:
-                self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-                self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
+                self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+                self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
                 self.cop_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.cop_end_dropout = nn.Dropout(p=config.linear_dropout)
 
@@ -987,39 +1544,41 @@ class OneIE(nn.Module):
             else:
                 self.relation_type_re_cop_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                 torch.nn.init.kaiming_uniform_(self.relation_type_re_cop_W, a=math.sqrt(5))
-        
+
         if self.use_high_order_re_grandparent:
 
             if self.config.decomp:
-                self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
-                self.entity_mid_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
-                self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size,bias=True)
+                self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
+                self.entity_mid_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
+                self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.entity_hidden_size, bias=True)
                 self.gp_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.gp_mid_dropout = nn.Dropout(p=config.linear_dropout)
                 self.gp_end_dropout = nn.Dropout(p=config.linear_dropout)
 
-                self.entity_start_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
-                self.entity_mid_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)            
-                self.entity_end_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size,self.config.decomp_size,bias=False)
+                self.entity_start_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                               bias=False)
+                self.entity_mid_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                             bias=False)
+                self.entity_end_re_gp_decomp_ffn = nn.Linear(self.config.entity_hidden_size, self.config.decomp_size,
+                                                             bias=False)
             else:
-                self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-                self.entity_mid_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-                self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
+                self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+                self.entity_mid_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+                self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
                 self.gp_start_dropout = nn.Dropout(p=config.linear_dropout)
                 self.gp_mid_dropout = nn.Dropout(p=config.linear_dropout)
                 self.gp_end_dropout = nn.Dropout(p=config.linear_dropout)
-           
 
             if self.config.share_relation_type_reps:
                 self.relation_type_re_gp_W = nn.Linear(self.entity_hidden_size, self.decomp_size, bias=False)
             else:
                 self.relation_type_re_gp_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
                 torch.nn.init.kaiming_uniform_(self.relation_type_re_gp_W, a=math.sqrt(5))
-            
+
         if self.use_high_order_rr_coparent:
-            self.trigger_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-            self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-            self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
+            self.trigger_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+            self.entity_start_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+            self.entity_end_re_cop_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
             self.cop_trigger_start_dropout = nn.Dropout(p=config.linear_dropout)
             self.cop_start_dropout = nn.Dropout(p=config.linear_dropout)
             self.cop_end_dropout = nn.Dropout(p=config.linear_dropout)
@@ -1027,11 +1586,11 @@ class OneIE(nn.Module):
             self.relation_type_re_cop_W = Parameter(torch.empty(self.relation_type_num, self.decomp_size))
             torch.nn.init.kaiming_uniform_(self.role_type_re_cop_W, a=math.sqrt(5))
             torch.nn.init.kaiming_uniform_(self.relation_type_re_cop_W, a=math.sqrt(5))
-        
+
         if self.use_high_order_rr_grandparent:
-            self.trigger_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-            self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
-            self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size,bias=True)
+            self.trigger_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+            self.entity_start_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
+            self.entity_end_re_gp_W = nn.Linear(self.bert_dim, self.config.decomp_size, bias=True)
             self.gp_trigger_start_dropout = nn.Dropout(p=config.linear_dropout)
             self.gp_start_dropout = nn.Dropout(p=config.linear_dropout)
             self.gp_end_dropout = nn.Dropout(p=config.linear_dropout)
@@ -1052,14 +1611,12 @@ class OneIE(nn.Module):
             self.alpha_entity_tre = self.config.alpha_entity_tre
             self.alpha_event_tre = self.config.alpha_event_tre
 
-        
         # -------------------------------------------------------------------------------
         if self.split_train:
             # breakpoint()
             self.load_ident_model(config.ident_model_path, device=config.gpu_device, gpu=config.use_gpu)
-        
-        self.debug = {}
 
+        self.debug = {}
 
     def load_ident_model(self, model_path, device=0, gpu=False):
         print('Loading the model from {}'.format(model_path))
@@ -1079,7 +1636,6 @@ class OneIE(nn.Module):
         if gpu:
             self.ident_model.cuda(device)
 
-
     def load_bert(self, name, cache_dir=None):
         """Load the pre-trained BERT model (used in training phrase)
         :param name (str): pre-trained BERT model name
@@ -1088,33 +1644,33 @@ class OneIE(nn.Module):
         print('Loading pre-trained BERT model {}'.format(name))
         if 'scibert' in name:
             self.bert = AutoModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                                )
+                                                  cache_dir=cache_dir,
+                                                  )
         elif 'albert' in name:
             # breakpoint()
             self.bert = AlbertModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                                )
+                                                    cache_dir=cache_dir,
+                                                    )
         elif 'roberta' in name:
             self.bert = RobertaModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                                )
+                                                     cache_dir=cache_dir,
+                                                     )
         else:
             self.bert = BertModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                              output_hidden_states=True)
+                                                  cache_dir=cache_dir,
+                                                  output_hidden_states=True)
 
-
-    #================================================================
+    # ================================================================
     def guideline_encode(self):
         # breakpoint()
         with torch.no_grad():
-            all_bert_outputs = self.bert(self.guideline_piexs.to(self.config.gpu_device), attention_mask=self.guideline_attn_masks.to(self.config.gpu_device))
+            all_bert_outputs = self.bert(self.guideline_piexs.to(self.config.gpu_device),
+                                         attention_mask=self.guideline_attn_masks.to(self.config.gpu_device))
             relation_type_output = all_bert_outputs[1]
             self.relation_reprs = relation_type_output
         return relation_type_output
-    #================================================================
 
+    # ================================================================
 
     def encode(self, piece_idxs, attention_masks, token_lens):
         """Encode input sequences with BERT
@@ -1123,7 +1679,7 @@ class OneIE(nn.Module):
         :param token_lens (list): token lengths
         """
         batch_size, _ = piece_idxs.size()
-        all_bert_outputs = self.bert(piece_idxs, attention_mask=attention_masks,output_hidden_states=True)
+        all_bert_outputs = self.bert(piece_idxs, attention_mask=attention_masks, output_hidden_states=True)
         bert_outputs = all_bert_outputs[0]
 
         if self.use_extra_bert:
@@ -1152,30 +1708,38 @@ class OneIE(nn.Module):
         return bert_outputs
 
 
-    def scores(self, bert_outputs, graphs, entity_types_onehot=None,
+    def scores(self, bert_outputs,batch ,graphs, entity_types_onehot=None,
                predict=False):
         (
             entity_idxs, sq_entity_masks, entity_num, entity_len,
             trigger_idxs, sq_trigger_masks, trigger_num, trigger_len,
         ) = graphs_to_node_idxs(graphs)
-        # 
+
+        sentences_per_batch, entities_per_batch, triggers_per_batch = graph_to_node_sentences(batch, graphs)
+        if not API_KEY or API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+            print("Error: Please set your actual DashScope API key in the script.")
+        else:
+            H_sem_rel, H_sem_rol = get_semantic_matrices_batch(
+                sentences_per_batch, entities_per_batch, triggers_per_batch, max_entity_num=entity_num, max_trigger_num=trigger_num
+            )
+        #
         batch_size, _, bert_dim = bert_outputs.size()
+        # position_encoder = ContinuousDynamicalPositionEncoding(d_model=bert_dim, max_len=512)
+
         # entity_idxs: max_entity_len=5, max_entity_num=6, -> [1 0 0 0 0; 2 3 0 0 0; 16 17 18 19 0; ...] 6 nums 5 segments;
         entity_idxs = bert_outputs.new_tensor(entity_idxs, dtype=torch.long)
         trigger_idxs = bert_outputs.new_tensor(trigger_idxs, dtype=torch.long)
         sq_entity_masks = bert_outputs.new_tensor(sq_entity_masks)
         sq_trigger_masks = bert_outputs.new_tensor(sq_trigger_masks)
-        
 
-       
-        #--------------------------------------------------------------------------------------
-        self.entity_masks = torch.reshape(torch.reshape(sq_entity_masks,(-1,entity_len)).sum(-1),(batch_size,-1))
-        self.trigger_masks = torch.reshape(torch.reshape(sq_trigger_masks,(-1,trigger_len)).sum(-1),(batch_size,-1))
-        self.rel_masks = torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1) # B x n x n
+        # --------------------------------------------------------------------------------------
+        self.entity_masks = torch.reshape(torch.reshape(sq_entity_masks, (-1, entity_len)).sum(-1), (batch_size, -1))
+        self.trigger_masks = torch.reshape(torch.reshape(sq_trigger_masks, (-1, trigger_len)).sum(-1), (batch_size, -1))
+        self.rel_masks = torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1)  # B x n x n
         self.rel_masks = self.rel_masks * torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                        (self.rel_masks.device), 0)
+                                                          (self.rel_masks.device), 0)
 
-        #--------------------------------------------------------------------------------------
+        # --------------------------------------------------------------------------------------
 
         # breakpoint()
         # entity type scores
@@ -1189,12 +1753,16 @@ class OneIE(nn.Module):
         if self.config.new_score:
             entity_self_reprs = self.entity_type_ffn(entity_reprs)
             entity_self_reprs = self.linear_entity_dropout(entity_self_reprs)
-            entity_type_scores = contract('bek,tk->bet', entity_self_reprs, self.unary_entity_type_reps)
+            _, _ , entity_h_dim = entity_self_reprs.size()
+            #     add pe
+            entity_self_reprs_pe = (entity_self_reprs + self.entity_typr_position_encoder(entity_self_reprs))
+            entity_type_scores = contract('bek,tk->bet', entity_self_reprs_pe, self.unary_entity_type_reps)
         else:
             entity_type_scores = self.entity_type_ffn(entity_reprs)
 
         # mention type scores
         mention_type_scores = self.mention_type_ffn(entity_reprs)
+
 
         # trigger type scores
         trigger_idxs = trigger_idxs.unsqueeze(-1).expand(-1, -1, bert_dim)
@@ -1203,17 +1771,21 @@ class OneIE(nn.Module):
         trigger_words = trigger_words * sq_trigger_masks
         trigger_words = trigger_words.view(batch_size, trigger_num, trigger_len, bert_dim)
         trigger_reprs = trigger_words.sum(2)
-        #===============================================================================================
+        # ===============================================================================================
         if self.config.new_score:
             trigger_self_reprs = self.event_type_ffn(trigger_reprs)
             trigger_self_reprs = self.linear_trigger_dropout(trigger_self_reprs)
-            event_type_scores = contract('btk,lk->btl', trigger_self_reprs, self.unary_trigger_type_reps)
+            #     add pe
+            _, _, trigger_h_dim = trigger_self_reprs.size()
+            trigger_self_reprs_pe = trigger_self_reprs + self.event_typr_position_encoder(trigger_self_reprs)
+            event_type_scores = contract('btk,lk->btl', trigger_self_reprs_pe, self.unary_trigger_type_reps)
         else:
             event_type_scores = self.event_type_ffn(trigger_reprs)
-        #===============================================================================================
+        # ===============================================================================================
 
         # relation type score
-        ee_idxs = generate_pairwise_idxs(entity_num, entity_num) #[0, 3, 0, 4, 0, 5, 1, 3, 1, 4, 1, 5, 2, 3, 2, 4, 2, 5]
+        ee_idxs = generate_pairwise_idxs(entity_num,
+                                         entity_num)  # [0, 3, 0, 4, 0, 5, 1, 3, 1, 4, 1, 5, 2, 3, 2, 4, 2, 5]
         # breakpoint()
         ee_idxs = entity_idxs.new(ee_idxs)
         ee_idxs = ee_idxs.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, bert_dim)
@@ -1222,13 +1794,30 @@ class OneIE(nn.Module):
         if self.config.new_score:
             start_entity_reps = self.linear_start_dropout(start_entity_reps)
             end_entity_reps = self.linear_end_dropout(end_entity_reps)
-            relation_type_scores = contract('bsk,bek,rk->bser', start_entity_reps, end_entity_reps, self.unary_relation_type_reps)
-            relation_type_scores = torch.reshape(relation_type_scores,(batch_size,-1,self.relation_type_num)).contiguous()
+            relation_type_scores = contract('bsk,bek,rk->bser', start_entity_reps, end_entity_reps,
+                                            self.unary_relation_type_reps)
+
+            H_sem_rel_tensor = torch.from_numpy(H_sem_rel).to(relation_type_scores.device).float()
+            H_sem_rel_tensor = H_sem_rel_tensor.unsqueeze(-1)
+            # Get shapes for comparison
+            scores_shape = relation_type_scores.shape  # Expected: (B, E, E, L)
+            h_sem_shape = H_sem_rel_tensor.shape  # Expected: (B, E, E)
+
+            # Check if shapes are compatible for broadcasting after unsqueeze
+            # Ensure scores has 4 dims, h_sem has 3 dims, and the first 3 dims match
+            if scores_shape[:3] == h_sem_shape:
+                # Shapes are compatible, perform unsqueeze and then broadcasting
+                H_sem_rel_tensor = H_sem_rel_tensor.unsqueeze(-1)  # Shape becomes (B, E, E, 1)
+                relation_type_scores = relation_type_scores * H_sem_rel_tensor
+            else:
+                relation_type_scores = relation_type_scores
+            relation_type_scores = torch.reshape(relation_type_scores,
+                                                 (batch_size, -1, self.relation_type_num)).contiguous()
         else:
             ee_reprs = torch.cat([start_entity_reps, end_entity_reps], dim=1)
             ee_reprs = torch.gather(ee_reprs, 1, ee_idxs)
             ee_reprs = ee_reprs.view(batch_size, -1, 2 * self.entity_hidden_size)
-            #=======================================================================
+            # =======================================================================
             if self.use_guideliens:
                 ee_reprs = self.entity_ffn(ee_reprs)
                 # breakpoint()
@@ -1236,7 +1825,7 @@ class OneIE(nn.Module):
                 relation_reprs = self.relation_ffn(self.relation_reprs)
                 # breakpoint()
                 relation_type_scores = contract('bnk,ek->bne', ee_reprs, relation_reprs)
-            #=======================================================================
+            # =======================================================================
             else:
                 # breakpoint()
                 relation_type_scores = self.relation_type_ffn(ee_reprs)
@@ -1250,7 +1839,7 @@ class OneIE(nn.Module):
         # breakpoint()
 
         # role type score
-        #==========================================================================================
+        # ==========================================================================================
         if self.config.new_score:
             # breakpoint()
             unary_trigger_reps = self.unary_trigger_ffn(trigger_reprs)
@@ -1265,8 +1854,20 @@ class OneIE(nn.Module):
                     unary_entity_reprs = torch.cat([entity_reprs, entity_types_onehot], dim=2)
             unary_argument_reps = self.unary_argument_ffn(unary_entity_reprs)
             unary_argument_reps = self.unary_argument_dropout(unary_argument_reps)
-            role_type_scores = contract('bsk,bek,rk->bser', unary_trigger_reps, unary_argument_reps, self.unary_role_type_reps)
-            role_type_scores = torch.reshape(role_type_scores,(batch_size,-1,self.role_type_num)).contiguous()
+            role_type_scores = contract('bsk,bek,rk->bser', unary_trigger_reps, unary_argument_reps,
+                                        self.unary_role_type_reps)
+            H_sem_rol_tensor = torch.from_numpy(H_sem_rol).to(role_type_scores.device).float()
+            # Get shapes for comparison
+            scores_shape = role_type_scores.shape  # Expected: (B, E, E, L)
+            h_sem_shape = H_sem_rol_tensor.shape  # Expected: (B, E, E)
+
+            if scores_shape[:3] == h_sem_shape:
+                # Shapes are compatible, perform unsqueeze and then broadcasting
+                H_sem_rol_tensor = H_sem_rol_tensor.unsqueeze(-1)  # Shape becomes (B, E, E, 1)
+                role_type_scores = role_type_scores * H_sem_rol_tensor
+            else:
+                role_type_scores = role_type_scores
+            role_type_scores = torch.reshape(role_type_scores, (batch_size, -1, self.role_type_num)).contiguous()
         else:
             te_idxs = generate_pairwise_idxs(trigger_num, entity_num)
             te_idxs = entity_idxs.new(te_idxs)
@@ -1283,10 +1884,9 @@ class OneIE(nn.Module):
                     entity_types_onehot = entity_types_onehot.repeat(1, trigger_num, 1)
                     te_reprs = torch.cat([te_reprs, entity_types_onehot], dim=2)
             role_type_scores = self.role_type_ffn(te_reprs)
-        #==========================================================================================
+        # ==========================================================================================
 
-
-        #---------------------------------------------------------------------------------------------------------------
+        # ---------------------------------------------------------------------------------------------------------------
         # high order
         # if self.use_high_order_tl or self.use_high_order_le or self.use_high_order_tre \
         #         or self.use_high_order_ere or self.use_high_order_sibling \
@@ -1295,7 +1895,7 @@ class OneIE(nn.Module):
         #     self.use_high_order = True
         # else:
         #     self.use_high_order = False
-        
+
         # if self.use_high_order:
         event_role_factor = None
         role_entity_factor = None
@@ -1313,29 +1913,31 @@ class OneIE(nn.Module):
         event_relation_cop_factor = None
         event_relation_gp_factor = None
 
-        
         if self.use_high_order_tl:
-            event_role_factor = self.event_role_factor_score(trigger_reprs,entity_reprs)
-        
+            event_role_factor = self.event_role_factor_score(trigger_reprs, entity_reprs)
+
         if self.use_high_order_le:
             if self.config.new_potential:
                 if self.valid_role_entity and self.config.penalized:
                     le_valid_pattern_mask = self.role_entity_factor_mask()
                     le_valid_pattern_mask = le_valid_pattern_mask.to(self.role_entity_potential.device)
                     role_entity_factor = self.role_entity_potential * le_valid_pattern_mask
-                role_entity_factor = self.role_entity_potential.repeat(batch_size,trigger_num,entity_num,1,1)
+                role_entity_factor = self.role_entity_potential.repeat(batch_size, trigger_num, entity_num, 1, 1)
                 # tre_pairs_mask: B x T x E
                 self.tre_pairs_mask = torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
                 role_entity_factor = role_entity_factor * torch.unsqueeze(torch.unsqueeze(self.tre_pairs_mask, -1), -1)
             else:
-                role_entity_factor = self.role_entity_factor_score(trigger_reprs,entity_reprs)
-        
+                role_entity_factor = self.role_entity_factor_score(trigger_reprs, entity_reprs)
+
         if self.use_high_order_tre:
             if self.config.new_potential:
-                event_role_entity_factor = self.event_role_entity_potential.repeat(batch_size,trigger_num,entity_num,1,1,1)
+                event_role_entity_factor = self.event_role_entity_potential.repeat(batch_size, trigger_num, entity_num,
+                                                                                   1, 1, 1)
                 # tre_pairs_mask: B x T x E
+
                 self.tre_pairs_mask = torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
-                event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(self.tre_pairs_mask, -1), -1),-1)
+                event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(
+                    torch.unsqueeze(torch.unsqueeze(self.tre_pairs_mask, -1), -1), -1)
             else:
                 event_role_entity_factor = self.event_role_entity_factor_score(trigger_reprs, entity_reprs)
 
@@ -1348,41 +1950,44 @@ class OneIE(nn.Module):
         if self.use_high_order_er:
             if self.config.new_potential:
                 # B x E x E x EL x RL
-                entity_relation_factor = self.entity_relation_potential.repeat(batch_size,entity_num,entity_num,1,1)
+                entity_relation_factor = self.entity_relation_potential.repeat(batch_size, entity_num, entity_num, 1, 1)
                 # B x E x E x RL x EL
-                relation_entity_factor = self.relation_entity_potential.repeat(batch_size,entity_num,entity_num,1,1)
-                
+                relation_entity_factor = self.relation_entity_potential.repeat(batch_size, entity_num, entity_num, 1, 1)
+
                 # er_pairs_mask: B x E x E
                 ere_pairs_mask = torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
-                entity_relation_factor = entity_relation_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1), -1)
-                relation_entity_factor = relation_entity_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1), -1)
+                entity_relation_factor = entity_relation_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1),
+                                                                                  -1)
+                relation_entity_factor = relation_entity_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1),
+                                                                                  -1)
 
                 # mask diag
                 entity_relation_factor = entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x 8 x 7 x E x E
                 entity_relation_factor = entity_relation_factor * \
-                                torch.unsqueeze(torch.unsqueeze(
-                                    torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                    (entity_relation_factor.device), 0), 0), 0)
+                                         torch.unsqueeze(torch.unsqueeze(
+                                             torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
+                                                             (entity_relation_factor.device), 0), 0), 0)
                 entity_relation_factor = entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x E x E x 8 x 7
                 relation_entity_factor = relation_entity_factor.permute(0, 3, 4, 1, 2)  # B x 8 x 7 x E x E
                 relation_entity_factor = relation_entity_factor * \
-                                torch.unsqueeze(torch.unsqueeze(
-                                    torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                    (relation_entity_factor.device), 0), 0), 0)
+                                         torch.unsqueeze(torch.unsqueeze(
+                                             torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
+                                                             (relation_entity_factor.device), 0), 0), 0)
                 relation_entity_factor = relation_entity_factor.permute(0, 3, 4, 1, 2)  # B x E x E x 8 x 7
             else:
                 if self.config.test_er:
                     # breakpoint()
-                    start_entity_relation_factor, end_entity_relation_factor = self.entity_relation_factor_score(entity_reprs)                        
+                    start_entity_relation_factor, end_entity_relation_factor = self.entity_relation_factor_score(
+                        entity_reprs)
                 else:
                     entity_relation_factor = self.entity_relation_factor_score(entity_reprs)
-        
+
         if self.use_high_order_coparent:
             event_role_cop_factor = self.event_entity_coparent_factor_score(trigger_reprs, entity_reprs)
 
         if self.use_high_order_re_sibling:
             entity_relation_sib_factor = self.entity_relation_sib_factor_score(entity_reprs)
-        
+
         if self.use_high_order_re_coparent:
             entity_relation_cop_factor = self.entity_relation_cop_factor_score(entity_reprs)
 
@@ -1391,44 +1996,44 @@ class OneIE(nn.Module):
 
         if self.use_high_order_rr_coparent:
             event_relation_cop_factor = self.event_relation_cop_factor_score(trigger_reprs, entity_reprs)
-        
+
         if self.use_high_order_rr_grandparent:
             event_relation_gp_factor = self.event_relation_gp_factor_score(trigger_reprs, entity_reprs)
 
         event_type_scores_q, role_type_scores, entity_type_scores_q, relation_type_scores \
-            = self.mfvi(event_type_scores[:,:,1:],role_type_scores,entity_type_scores[:,:,1:],relation_type_scores,
-                                                            event_role_factor = event_role_factor,
-                                                            role_entity_factor = role_entity_factor,
-                                                            event_role_entity_factor=event_role_entity_factor,
-                                                            event_role_sibling_factor=event_role_sibling_factor,
-                                                            event_role_cop_factor=event_role_cop_factor,
-                                                            entity_relation_entity_factor=entity_relation_entity_factor,
-                                                            relation_entity_factor = relation_entity_factor,
-                                                            entity_relation_factor = entity_relation_factor,
-                                                            entity_relation_sib_factor=entity_relation_sib_factor,
-                                                            entity_relation_cop_factor=entity_relation_cop_factor,
-                                                            entity_relation_gp_factor=entity_relation_gp_factor,
-                                                            start_entity_relation_factor = start_entity_relation_factor,
-                                                            end_entity_relation_factor = end_entity_relation_factor,
-                                                            event_relation_cop_factor = event_relation_cop_factor,
-                                                            event_relation_gp_factor = event_relation_gp_factor,
-                                                            )
-        
-        entity_type_scores = torch.cat((entity_type_scores[:,:,0:1],entity_type_scores_q),-1)
-        event_type_scores = torch.cat((event_type_scores[:,:,0:1],event_type_scores_q),-1)
-        
+            = self.sgvi(event_type_scores[:, :, 1:], role_type_scores, entity_type_scores[:, :, 1:],
+                        relation_type_scores,
+                        event_role_factor=event_role_factor,
+                        role_entity_factor=role_entity_factor,
+                        event_role_entity_factor=event_role_entity_factor,
+                        event_role_sibling_factor=event_role_sibling_factor,
+                        event_role_cop_factor=event_role_cop_factor,
+                        entity_relation_entity_factor=entity_relation_entity_factor,
+                        relation_entity_factor=relation_entity_factor,
+                        entity_relation_factor=entity_relation_factor,
+                        entity_relation_sib_factor=entity_relation_sib_factor,
+                        entity_relation_cop_factor=entity_relation_cop_factor,
+                        entity_relation_gp_factor=entity_relation_gp_factor,
+                        start_entity_relation_factor=start_entity_relation_factor,
+                        end_entity_relation_factor=end_entity_relation_factor,
+                        event_relation_cop_factor=event_relation_cop_factor,
+                        event_relation_gp_factor=event_relation_gp_factor,
+                        )
+
+        entity_type_scores = torch.cat((entity_type_scores[:, :, 0:1], entity_type_scores_q), -1)
+        event_type_scores = torch.cat((event_type_scores[:, :, 0:1], event_type_scores_q), -1)
+
         if self.config.split_rel_ident:
             return (entity_type_scores, mention_type_scores, event_type_scores, relation_ident_scores,
-                relation_type_scores, role_type_scores)  
-        
+                    relation_type_scores, role_type_scores)
+
         return (entity_type_scores, mention_type_scores, event_type_scores,
                 relation_type_scores, role_type_scores)
-
 
     def rebatch(self, batch, entities, triggers):
         # batch_graphs = batch.graphs
         # instances = batch.instances
-        data=[]
+        data = []
 
         for pred_entities, pred_triggers, instance in zip(entities, triggers, batch.instances):
             vocabs = instance.graph.vocabs
@@ -1446,28 +2051,27 @@ class OneIE(nn.Module):
             # trigger_num = instance.trigger_num
 
             # new entity list and mention list
-            pred_entities_set = set([(entity[0],entity[1]) for entity in pred_entities])
-            gold_entities_set = set([(entity[0],entity[1]) for entity in entity_list])
+            pred_entities_set = set([(entity[0], entity[1]) for entity in pred_entities])
+            gold_entities_set = set([(entity[0], entity[1]) for entity in entity_list])
             wrong_preds = pred_entities_set.difference(gold_entities_set)
             wrong_preds = remove_overlap_entities(gold_entities_set, wrong_preds)
-            # 
+            #
             for wrong_pred in wrong_preds:
-                entity_list.append((wrong_pred[0],wrong_pred[1],0))
-                mention_list.append((wrong_pred[0],wrong_pred[1],0))
+                entity_list.append((wrong_pred[0], wrong_pred[1], 0))
+                mention_list.append((wrong_pred[0], wrong_pred[1], 0))
             entity_list.sort(key=lambda x: x[0])
             mention_list.sort(key=lambda x: x[0])
 
             entity_type_idxs = [entity[-1] for entity in entity_list]
             mention_type_idxs = [mention[-1] for mention in mention_list]
 
-
             # new trigger list
-            pred_triggers_set = set([(trigger[0],trigger[1]) for trigger in pred_triggers])
-            gold_triggers_set = set([(trigger[0],trigger[1]) for trigger in trigger_list])
+            pred_triggers_set = set([(trigger[0], trigger[1]) for trigger in pred_triggers])
+            gold_triggers_set = set([(trigger[0], trigger[1]) for trigger in trigger_list])
             wrong_preds = list(pred_triggers_set.difference(gold_triggers_set))
             wrong_preds = remove_overlap_entities(gold_triggers_set, wrong_preds)
             for wrong_pred in wrong_preds:
-                trigger_list.append((wrong_pred[0],wrong_pred[1],0))
+                trigger_list.append((wrong_pred[0], wrong_pred[1], 0))
             trigger_list.sort(key=lambda x: x[0])
             event_type_idxs = [event[-1] for event in trigger_list]
 
@@ -1476,9 +2080,9 @@ class OneIE(nn.Module):
             trigger_num = len(trigger_list)
 
             # if entity_num != instance.entity_num:
-            #     
+            #
             # if trigger_num != instance.trigger_num:
-            #     
+            #
 
             # relation types
             relation_type_idxs = [[0 for _ in range(entity_num)]
@@ -1489,16 +2093,17 @@ class OneIE(nn.Module):
                 relation_type_idxs[entity_list.index(entity1)][entity_list.index(entity2)] = relation[2]
                 if not self.config.relation_directional:
                     relation_type_idxs[entity_list.index(entity2)][entity_list.index(entity1)] = relation[2]
-                if self.config.symmetric_relations and self.relation_type_itos[relation[2]] in self.config.symmetric_relations:
+                if self.config.symmetric_relations and self.relation_type_itos[
+                    relation[2]] in self.config.symmetric_relations:
                     relation_type_idxs[entity_list.index(entity2)][entity_list.index(entity1)] = relation[2]
             if self.config.relation_mask_self:
                 for i in range(len(relation_type_idxs)):
                     relation_type_idxs[i][i] = -100
 
-            # 
+            #
             # role types
             role_type_idxs = [[0 for _ in range(entity_num)]
-                                  for _ in range(trigger_num)]
+                              for _ in range(trigger_num)]
             for role in role_list:
                 trigger = instance.graph.triggers[role[0]]
                 entity = instance.graph.entities[role[1]]
@@ -1538,9 +2143,8 @@ class OneIE(nn.Module):
 
         return new_batch
 
-
     def collate_fn(self, batch):
-        # 
+        #
         batch_piece_idxs = []
         batch_tokens = []
         batch_entity_labels, batch_trigger_labels = [], []
@@ -1617,7 +2221,7 @@ class OneIE(nn.Module):
             token_nums = torch.LongTensor(token_nums)
 
         return Batch(
-            instances= batch,
+            instances=batch,
             sent_ids=sent_ids,
             tokens=[inst.tokens for inst in batch],
             piece_idxs=batch_piece_idxs,
@@ -1634,17 +2238,15 @@ class OneIE(nn.Module):
             token_nums=token_nums,
         )
 
-
     def forward(self, batch):
         # encoding
         # from torch.profiler import profile, record_function, ProfilerActivity
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True,) as prof:
         #     with record_function("model"):
         bert_outputs = self.encode(batch.piece_idxs,
-                                batch.attention_masks,
-                                batch.token_lens)
+                                   batch.attention_masks,
+                                   batch.token_lens)
         batch_size, _, _ = bert_outputs.size()
-
 
         # lists of [[[start,end,label],...],[[],...],....]
 
@@ -1653,15 +2255,13 @@ class OneIE(nn.Module):
 
             batch = self.rebatch(batch, predicted_entities, predicted_triggers)
 
-
         #
         # entity type indices -> one hot
         entity_types = batch.entity_type_idxs.view(batch_size, -1)
         entity_types = torch.clamp(entity_types, min=0)
         entity_types_onehot = bert_outputs.new_zeros(*entity_types.size(),
-                                                    self.entity_type_num)
+                                                     self.entity_type_num)
         entity_types_onehot.scatter_(2, entity_types.unsqueeze(-1), 1)
-
 
         # identification
         if not self.split_train:
@@ -1670,30 +2270,24 @@ class OneIE(nn.Module):
 
             entity_label_scores = self.entity_crf.pad_logits(entity_label_scores)
             entity_label_loglik = self.entity_crf.loglik(entity_label_scores,
-                                                        batch.entity_label_idxs,
-                                                        batch.token_nums)
+                                                         batch.entity_label_idxs,
+                                                         batch.token_nums)
             trigger_label_scores = self.trigger_crf.pad_logits(trigger_label_scores)
             trigger_label_loglik = self.trigger_crf.loglik(trigger_label_scores,
-                                                        batch.trigger_label_idxs,
-                                                        batch.token_nums)
+                                                           batch.trigger_label_idxs,
+                                                           batch.token_nums)
 
         # classification
-        scores = self.scores(bert_outputs, batch.graphs, entity_types_onehot)
+        scores = self.scores(bert_outputs, batch , batch.graphs, entity_types_onehot)
         if self.config.split_rel_ident:
-            ( entity_type_scores, mention_type_scores, event_type_scores, relation_ident_scores, 
-                relation_type_scores, role_type_scores
-            ) = scores
-            relation_ident_scores = relation_ident_scores.view(-1,2)
+            (entity_type_scores, mention_type_scores, event_type_scores, relation_ident_scores,
+             relation_type_scores, role_type_scores
+             ) = scores
+            relation_ident_scores = relation_ident_scores.view(-1, 2)
         else:
-            ( entity_type_scores, mention_type_scores, event_type_scores,
-                relation_type_scores, role_type_scores
-            ) = scores
-            print("entity_type_scores",entity_type_scores)
-            # Check if the sum of entity_type_scores is 1
-            if torch.sum(entity_type_scores) == 1:
-                print("The sum of entity_type_scores is 1")
-            else:
-                print("The sum of entity_type_scores is not 1")
+            (entity_type_scores, mention_type_scores, event_type_scores,
+             relation_type_scores, role_type_scores
+             ) = scores
         try:
             relation_type_scores = relation_type_scores.view(-1, self.relation_type_num)
             entity_type_scores = entity_type_scores.view(-1, self.entity_type_num)
@@ -1703,39 +2297,50 @@ class OneIE(nn.Module):
         except:
             breakpoint()
 
-
         # breakpoint()
         if self.config.split_rel_ident:
             # gold_rel_ident = torch.zeros_like(batch.relation_type_idxs)
-            gold_rel_ident = torch.where(batch.relation_type_idxs>0,1,batch.relation_type_idxs)
+            gold_rel_ident = torch.where(batch.relation_type_idxs > 0, 1, batch.relation_type_idxs)
             # gold_rel_cls = torch.zeros_like(batch.relation_type_idxs)
-            gold_rel_cls = torch.where(batch.relation_type_idxs>0, batch.relation_type_idxs, -100)
+            gold_rel_cls = torch.where(batch.relation_type_idxs > 0, batch.relation_type_idxs, -100)
             # breakpoint()
             classification_loss = self.entity_criteria(entity_type_scores,
-                                                batch.entity_type_idxs) + \
-                            self.event_criteria(event_type_scores,
-                                                batch.event_type_idxs) + \
-                            self.role_criteria(role_type_scores,
-                                                batch.role_type_idxs) + \
-                            self.mention_criteria(mention_type_scores,
-                                                    batch.mention_type_idxs) + \
-                            9*self.relation_ident_criteria(relation_ident_scores,
-                                                    gold_rel_ident) + \
-                            self.relation_criteria(relation_type_scores,
-                                                        gold_rel_cls)
-            
+                                                       batch.entity_type_idxs) + \
+                                  self.event_criteria(event_type_scores,
+                                                      batch.event_type_idxs) + \
+                                  self.role_criteria(role_type_scores,
+                                                     batch.role_type_idxs) + \
+                                  self.mention_criteria(mention_type_scores,
+                                                        batch.mention_type_idxs) + \
+                                  9 * self.relation_ident_criteria(relation_ident_scores,
+                                                                   gold_rel_ident) + \
+                                  self.relation_criteria(relation_type_scores,
+                                                         gold_rel_cls)
+            entity_loss = self.entity_criteria(entity_type_scores, batch.entity_type_idxs)
+            event_loss = self.event_criteria(event_type_scores, batch.event_type_idxs)
+            role_loss = self.role_criteria(role_type_scores, batch.role_type_idxs)
+            mention_loss = self.mention_criteria(mention_type_scores, batch.mention_type_idxs)
+            relation_loss = self.relation_criteria(relation_type_scores, batch.relation_type_idxs)
+
         else:
             # classification_loss = self.entity_criteria(entity_type_scores, batch.entity_type_idxs)+self.relation_criteria(relation_type_scores, batch.relation_type_idxs)
             classification_loss = self.entity_criteria(entity_type_scores,
-                                                batch.entity_type_idxs) + \
-                            self.event_criteria(event_type_scores,
-                                                batch.event_type_idxs) + \
-                            self.role_criteria(role_type_scores,
-                                                batch.role_type_idxs) + \
-                            self.mention_criteria(mention_type_scores,
-                                                    batch.mention_type_idxs) + \
-                            self.relation_criteria(relation_type_scores,
-                                                        batch.relation_type_idxs)
+                                                       batch.entity_type_idxs) + \
+                                  self.event_criteria(event_type_scores,
+                                                      batch.event_type_idxs) + \
+                                  self.role_criteria(role_type_scores,
+                                                     batch.role_type_idxs) + \
+                                  self.mention_criteria(mention_type_scores,
+                                                        batch.mention_type_idxs) + \
+                                  self.relation_criteria(relation_type_scores,
+                                                         batch.relation_type_idxs)
+
+            entity_loss = self.entity_criteria(entity_type_scores, batch.entity_type_idxs)
+            event_loss = self.event_criteria(event_type_scores, batch.event_type_idxs)
+            role_loss = self.role_criteria(role_type_scores, batch.role_type_idxs)
+            mention_loss = self.mention_criteria(mention_type_scores, batch.mention_type_idxs)
+            relation_loss = self.relation_criteria(relation_type_scores, batch.relation_type_idxs)
+
             # breakpoint()
         if not self.split_train:
             loss = classification_loss - entity_label_loglik.mean() - trigger_label_loglik.mean()
@@ -1751,9 +2356,8 @@ class OneIE(nn.Module):
             top_scores = self.compute_graph_scores(top_graphs, scores)
             global_loss = (top_scores - gold_scores).clamp(min=0)
             loss = loss + global_loss.mean()
-        return loss
+        return  loss, entity_loss, mention_loss, relation_loss , event_loss, role_loss
 
-        
     def predict_(self, batch):
         self.eval()
 
@@ -1761,7 +2365,7 @@ class OneIE(nn.Module):
                                    batch.attention_masks,
                                    batch.token_lens)
         batch_size, _, _ = bert_outputs.size()
-        # 
+        #
 
         # identification
         if self.split_train:
@@ -1772,21 +2376,19 @@ class OneIE(nn.Module):
             trigger_label_scores = self.trigger_label_ffn(bert_outputs)
             trigger_label_scores = self.trigger_crf.pad_logits(trigger_label_scores)
             _, entity_label_preds = self.entity_crf.viterbi_decode(entity_label_scores,
-                                                                batch.token_nums)
+                                                                   batch.token_nums)
             _, trigger_label_preds = self.trigger_crf.viterbi_decode(trigger_label_scores,
-                                                                    batch.token_nums)
+                                                                     batch.token_nums)
             entities = tag_paths_to_spans(entity_label_preds,
-                                        batch.token_nums,
-                                        self.entity_label_stoi)
+                                          batch.token_nums,
+                                          self.entity_label_stoi)
             triggers = tag_paths_to_spans(trigger_label_preds,
-                                        batch.token_nums,
-                                        self.trigger_label_stoi)
-
-        
+                                          batch.token_nums,
+                                          self.trigger_label_stoi)
 
         node_graphs = [Graph(e, t, [], [], self.vocabs)
                        for e, t in zip(entities, triggers)]
-        scores = self.scores(bert_outputs, node_graphs, predict=True)
+        scores = self.scores(bert_outputs, batch,node_graphs, predict=True)
         max_entity_num = max(max(len(seq_entities) for seq_entities in entities), 1)
 
         batch_graphs = []
@@ -1801,7 +2403,7 @@ class OneIE(nn.Module):
                 # skip decoding
                 batch_graphs.append(Graph.empty_graph(self.vocabs))
                 continue
-           
+
             graph = self.decode(spans,
                                 entity_type_scores=scores[0][i],
                                 mention_type_scores=scores[1][i],
@@ -1814,7 +2416,6 @@ class OneIE(nn.Module):
         self.train()
         return batch_graphs
 
-
     def compute_graph_scores(self, graphs, scores):
         (
             entity_type_scores, _mention_type_scores,
@@ -1823,8 +2424,8 @@ class OneIE(nn.Module):
         ) = scores
         label_idxs = graphs_to_label_idxs(graphs)
         label_idxs = [entity_type_scores.new_tensor(idx,
-                                               dtype=torch.long if i % 2 == 0
-                                               else torch.float)
+                                                    dtype=torch.long if i % 2 == 0
+                                                    else torch.float)
                       for i, idx in enumerate(label_idxs)]
         (
             entity_idxs, entity_mask, trigger_idxs, trigger_mask,
@@ -1862,7 +2463,6 @@ class OneIE(nn.Module):
 
         return score
 
-
     def generate_locally_top_graphs(self, graphs, scores):
         (
             entity_type_scores, _mention_type_scores,
@@ -1882,7 +2482,7 @@ class OneIE(nn.Module):
             top_triggers = top_triggers.tolist()[:trigger_num]
             top_triggers = [(i, j, k) for (i, j, _), k in
                             zip(graph.triggers, top_triggers)]
-            
+
             top_relation_scores, top_relation_labels = relation_type_scores[graph_idx].max(1)
             top_relation_scores = top_relation_scores.tolist()
             top_relation_labels = top_relation_labels.tolist()
@@ -1895,7 +2495,7 @@ class OneIE(nn.Module):
                         score_2, label_2 = top_relations[j * max_entity_num + i]
                         if score_1 > score_2 and label_1 != 0:
                             top_relation_list.append((i, j, label_1))
-                        if score_2 > score_1 and label_2 != 0: 
+                        if score_2 > score_1 and label_2 != 0:
                             top_relation_list.append((j, i, label_2))
 
             _, top_roles = role_type_scores[graph_idx].max(1)
@@ -1913,13 +2513,11 @@ class OneIE(nn.Module):
             ))
         return top_graphs
 
-
     def trim_beam_set(self, beam_set, beam_size):
         if len(beam_set) > beam_size:
             beam_set.sort(key=lambda x: self.compute_graph_score(x), reverse=True)
             beam_set = beam_set[:beam_size]
         return beam_set
-
 
     def compute_graph_score(self, graph):
         score = graph.graph_local_score
@@ -1931,7 +2529,6 @@ class OneIE(nn.Module):
             global_score = global_vector.dot(self.global_feature_weights).item()
             score = score + global_score
         return score
-
 
     def decode(self,
                spans,
@@ -1953,15 +2550,14 @@ class OneIE(nn.Module):
                 node_scores = event_type_scores[trigger_idx].tolist()
             node_scores_norm = normalize_score(node_scores)
             node_scores = [(s, i, n) for i, (s, n) in enumerate(zip(node_scores,
-                                                                node_scores_norm))]
+                                                                    node_scores_norm))]
             node_scores.sort(key=lambda x: x[0], reverse=True)
             top_node_scores = node_scores[:self.beta_v]
-
 
             beam_set_ = []
             for graph in beam_set:
                 for score, label, score_norm in top_node_scores:
-             
+
                     graph_ = graph.copy()
                     if is_entity_node:
                         graph_.add_entity(start, end, label, score, score_norm)
@@ -2099,12 +2695,9 @@ class OneIE(nn.Module):
                         in zip(graph.entities, mention_types)]
         graph.mentions = mention_list
 
-     
-
         return graph
-    
-    
-    # ------------------------------------------------------------------------------------------------  
+
+    # ------------------------------------------------------------------------------------------------
     def predict(self, batch):
         self.eval()
 
@@ -2112,8 +2705,6 @@ class OneIE(nn.Module):
                                    batch.attention_masks,
                                    batch.token_lens)
         batch_size, _, _ = bert_outputs.size()
-
-
 
         # identification
 
@@ -2127,7 +2718,7 @@ class OneIE(nn.Module):
                         entities.append([])
                     else:
                         for entity in sent:
-                            sent_entity.append([entity[0],entity[1], self.entity_type_itos[entity[2]]])
+                            sent_entity.append([entity[0], entity[1], self.entity_type_itos[entity[2]]])
                         entities.append(sent_entity)
 
                 triggers_ = [graph.triggers for graph in batch.graphs]
@@ -2138,7 +2729,7 @@ class OneIE(nn.Module):
                         triggers.append([])
                     else:
                         for trigger in sent:
-                            sent_trigger.append([trigger[0],trigger[1], self.event_type_itos[trigger[2]]])
+                            sent_trigger.append([trigger[0], trigger[1], self.event_type_itos[trigger[2]]])
                         triggers.append(sent_trigger)
                 # breakpoint()
             else:
@@ -2159,12 +2750,10 @@ class OneIE(nn.Module):
                                           batch.token_nums,
                                           self.trigger_label_stoi)
 
-       
-
         node_graphs = [Graph(e, t, [], [], self.vocabs)
                        for e, t in zip(entities, triggers)]
-        
-        scores = self.scores(bert_outputs, node_graphs, predict=True)
+
+        scores = self.scores(bert_outputs, batch,node_graphs, predict=True)
         max_entity_num = max(max(len(seq_entities) for seq_entities in entities), 1)
         max_event_num = max(max(len(seq_events) for seq_events in triggers), 1)
 
@@ -2173,7 +2762,7 @@ class OneIE(nn.Module):
         entity_scores, entity_types = scores[0].max(dim=-1)
         mention_scores, mention_types = scores[1].max(dim=-1)
         event_scores, event_types = scores[2].max(dim=-1)
-        
+
         if self.config.split_rel_ident:
             relation_scores, relation_types = scores[4].max(dim=-1)
             relation_ident_scores, relation_idents = scores[3].max(dim=-1)
@@ -2182,17 +2771,16 @@ class OneIE(nn.Module):
             relation_scores, relation_types = scores[3].max(dim=-1)
             role_scores, role_types = scores[4].max(dim=-1)
         for i in range(batch_size):
-            
+
             i_entities = entities[i]
             entity_num = len(i_entities)
             i_entity_types = entity_types[i][:entity_num]
             i_entity_scores = entity_scores[i][:entity_num]
-            # 
+            #
             entity_list = []
             for j in range(len(i_entity_types)):
-                entity_list.append((i_entities[j][0],i_entities[j][1],int(i_entity_types[j])))
-            
-           
+                entity_list.append((i_entities[j][0], i_entities[j][1], int(i_entity_types[j])))
+
             i_mention_types = mention_types[i][:entity_num]
             mention_list = []
             for j in range(len(i_mention_types)):
@@ -2207,43 +2795,44 @@ class OneIE(nn.Module):
                 event_list.append((i_events[j][0], i_events[j][1], int(i_event_types[j])))
 
             # breakpoint()
-            i_relations = relation_types.view(-1,max_entity_num,max_entity_num)[i][:entity_num,:entity_num]
+            i_relations = relation_types.view(-1, max_entity_num, max_entity_num)[i][:entity_num, :entity_num]
             if self.config.split_rel_ident:
-                i_relation_idents = relation_idents.view(-1,max_entity_num,max_entity_num)[i][:entity_num,:entity_num]
+                i_relation_idents = relation_idents.view(-1, max_entity_num, max_entity_num)[i][:entity_num,
+                                    :entity_num]
                 i_relations = i_relations * i_relation_idents
-            mask_diag = (1-torch.eye(entity_num,entity_num)).type_as(i_relations).to(i_relations.device)
-            i_relations = i_relations*mask_diag
-            i_relation_scores = relation_scores.view(-1,max_entity_num,max_entity_num)[i][:entity_num,:entity_num]
-            select = i_relations>0
+            mask_diag = (1 - torch.eye(entity_num, entity_num)).type_as(i_relations).to(i_relations.device)
+            i_relations = i_relations * mask_diag
+            i_relation_scores = relation_scores.view(-1, max_entity_num, max_entity_num)[i][:entity_num, :entity_num]
+            select = i_relations > 0
             i_relation_scores = i_relation_scores[select]
-            pred_relations = torch.cat((torch.nonzero(select,as_tuple=False), i_relations[select].unsqueeze(-1)), -1)
+            pred_relations = torch.cat((torch.nonzero(select, as_tuple=False), i_relations[select].unsqueeze(-1)), -1)
             relation_list = [tuple(i.tolist()) for i in pred_relations]
 
             i_roles = role_types.view(-1, max_event_num, max_entity_num)[i][:trigger_num, :entity_num]
             i_role_scores = role_scores.view(-1, max_event_num, max_entity_num)[i][:trigger_num, :entity_num]
             select = i_roles > 0
             i_role_scores = i_role_scores[select]
-            pred_roles = torch.cat((torch.nonzero(select,as_tuple=False), i_roles[select].unsqueeze(-1)), -1)
+            pred_roles = torch.cat((torch.nonzero(select, as_tuple=False), i_roles[select].unsqueeze(-1)), -1)
             # roles_list = [tuple(i.tolist()) for i in pred_roles]
             roles_list = []
             for i in pred_roles:
                 trigger_idx, entity_idx, role_type = i
                 event_type = event_list[trigger_idx][-1]
                 entity_type = entity_list[entity_idx][-1]
-                if int(event_type*100+role_type) in self.valid_event_role and int(role_type*100+entity_type) in self.valid_role_entity:
+                if int(event_type * 100 + role_type) in self.valid_event_role and int(
+                        role_type * 100 + entity_type) in self.valid_role_entity:
                     roles_list.append(tuple(i.tolist()))
 
             graph = Graph(entity_list, event_list, relation_list, roles_list, self.vocabs, mention_list)
             graph.entity_scores = i_entity_scores.tolist()
-            # 
+            #
             graph.trigger_scores = i_event_scores.tolist()
             graph.relation_scores = i_relation_scores.tolist()
             graph.role_scores = i_role_scores.tolist()
             batch_graphs.append(graph)
-        
+
         self.train()
         return batch_graphs
-
 
     # ------------------------------------------------------------------------------------------------
     def event_role_factor_mask(self):
@@ -2255,7 +2844,6 @@ class OneIE(nn.Module):
         # mask[:, 0] = 1
         return mask
 
-        
     # ------------------------------------------------------------------------------------------------
     def role_entity_factor_mask(self):
         mask = torch.zeros(self.role_type_num, self.entity_type_num).fill_(0)
@@ -2266,7 +2854,6 @@ class OneIE(nn.Module):
         mask[0, :] = 0
         mask[:, 0] = 0
         return mask
-
 
     # ------------------------------------------------------------------------------------------------
     def event_role_entity_factor_mask(self):
@@ -2287,31 +2874,28 @@ class OneIE(nn.Module):
         mask[1:, 0, 1:] = 0
         return mask
 
-
     def event_role_entity_factor_mask_nonrole(self):
-        mask = torch.zeros(self.event_type_num-1, self.role_type_num, self.entity_type_num-1).fill_(1.)
+        mask = torch.zeros(self.event_type_num - 1, self.role_type_num, self.entity_type_num - 1).fill_(1.)
         mask[:, 0, :] = 0.
         return mask
 
-
     # ------------------------------------------------------------------------------------------------
     def entity_relation_entity_factor_mask(self):
-        mask = torch.zeros(self.entity_type_num-1, self.relation_type_num, self.entity_type_num-1).fill_(-1111)
+        mask = torch.zeros(self.entity_type_num - 1, self.relation_type_num, self.entity_type_num - 1).fill_(-1111)
         relation_entity_dict = {}
         for relation_entity in self.valid_relation_entity:
             relation_idx = int(relation_entity / 100)
             entity_idx = relation_entity % 100
             if relation_idx in relation_entity_dict:
-                relation_entity_dict[relation_idx].append(entity_idx-1)
+                relation_entity_dict[relation_idx].append(entity_idx - 1)
             else:
-                relation_entity_dict[relation_idx] = [entity_idx-1]
+                relation_entity_dict[relation_idx] = [entity_idx - 1]
         for relation_idx in relation_entity_dict:
             for entity_idx_s in relation_entity_dict[relation_idx]:
                 for entity_idx_e in relation_entity_dict[relation_idx]:
                     mask[entity_idx_s, relation_idx, entity_idx_e] = 1
-        mask[:,0,:] = 0
+        mask[:, 0, :] = 0
         return mask
-
 
     # ------------------------------------------------------------------------------------------------
     def entity_relation_factor_mask(self):
@@ -2323,19 +2907,17 @@ class OneIE(nn.Module):
         mask[1:, 0] = 0
         return mask
 
-
     # ------------------------------------------------------------------------------------------------
     def event_role_factor_score(self, trigger_reps, entity_reps):
         trigger_reps = self.trigger_tl_W(trigger_reps)
-        entity_reps =  self.entity_tl_W(entity_reps)
+        entity_reps = self.entity_tl_W(entity_reps)
         event_type_reps = self.event_type_tl_W  # 34 x k
         role_type_reps = self.role_type_tl_W  # 23 x k
-       
 
         # (B x T x E x 34 x 23) * (34 x 23) tl_valid_pattern_mask
         event_role_factor = contract('bnk,bmk,tk,lk-> bnmtl', trigger_reps, entity_reps, event_type_reps,
-                                            role_type_reps)
-        # 
+                                     role_type_reps)
+        #
         if self.valid_event_role:
             tl_valid_pattern_mask = self.event_role_factor_mask()
             tl_valid_pattern_mask = tl_valid_pattern_mask.to(event_role_factor.device)
@@ -2344,31 +2926,29 @@ class OneIE(nn.Module):
             # event_role_factor = torch.where(tl_valid_pattern_mask>0, event_role_factor, torch.tensor(-1111.).to(event_role_factor.device))
             # event_role_factor[:,:,:,:,0] = torch.tensor(0.).to(event_role_factor.device)
 
-
         # tre_pairs_mask: B x T x E
         tre_pairs_mask = torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
         event_role_factor = event_role_factor * torch.unsqueeze(torch.unsqueeze(tre_pairs_mask, -1), -1)
 
         return event_role_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def role_entity_factor_score(self, trigger_reps, entity_reps):
         trigger_reps = self.trigger_le_W(trigger_reps)
-        entity_reps =  self.entity_le_W(entity_reps)
+        entity_reps = self.entity_le_W(entity_reps)
         role_type_reps = self.role_type_le_W  # 23 x k
-        entity_type_reps = self.entity_type_le_W # 8 x k
+        entity_type_reps = self.entity_type_le_W  # 8 x k
 
         # breakpoint()
         # (B x T x E x 23 x 8) * (23 x 8) le_valid_pattern_mask
         role_entity_factor = contract('bnk,bmk,lk,ek-> bnmle', trigger_reps, entity_reps, role_type_reps,
-                                            entity_type_reps)
+                                      entity_type_reps)
         if self.valid_role_entity:
             le_valid_pattern_mask = self.role_entity_factor_mask()
             le_valid_pattern_mask = le_valid_pattern_mask.to(role_entity_factor.device)
             role_entity_factor = role_entity_factor * torch.unsqueeze(
                 torch.unsqueeze(torch.unsqueeze(le_valid_pattern_mask, 0), 0), 0)
-       
+
         # tre_pairs_mask: B x T x E
         tre_pairs_mask = torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
         role_entity_factor = role_entity_factor * torch.unsqueeze(torch.unsqueeze(tre_pairs_mask, -1), -1)
@@ -2376,28 +2956,28 @@ class OneIE(nn.Module):
 
         return role_entity_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def event_role_entity_factor_score(self, trigger_reps, entity_reps):
-        # 
+        #
         tre_trigger_reps = self.trigger_tre_W(trigger_reps)
         tre_trigger_reps = self.trigger_tre_dropout(tre_trigger_reps)  # B x T x k
-        tre_entity_reps =  self.entity_tre_W(entity_reps)
+        tre_entity_reps = self.entity_tre_W(entity_reps)
         tre_entity_reps = self.entity_tre_dropout(tre_entity_reps)  # B x E x k
         event_type_reps = self.event_type_W  # 34-1 x k
         role_type_reps = self.role_type_W  # 23 x k
         entity_type_reps = self.entity_type_W  # 8-1 x k
 
         # (B x T x E x 34 x 23 x 8) * (34 x 23 x 8) tre_valid_pattern_mask
-        event_role_entity_factor = contract('bnk,bmk,tk,rk,ek-> bnmtre', tre_trigger_reps, tre_entity_reps, event_type_reps,
+        event_role_entity_factor = contract('bnk,bmk,tk,rk,ek-> bnmtre', tre_trigger_reps, tre_entity_reps,
+                                            event_type_reps,
                                             role_type_reps, entity_type_reps)
-        # 
+        #
         # if self.valid_role_entity and self.valid_event_role:
         #     tre_valid_pattern_mask = self.event_role_entity_factor_mask()
         #     tre_valid_pattern_mask = tre_valid_pattern_mask.to(event_role_entity_factor.device)
         #     event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(
         #         torch.unsqueeze(torch.unsqueeze(tre_valid_pattern_mask, 0), 0), 0)
-       
+
         # tre_pairs_mask: B x T x E
         tre_pairs_mask = torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
         event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(
@@ -2405,12 +2985,11 @@ class OneIE(nn.Module):
 
         return event_role_entity_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def event_entity_sibling_factor_score(self, trigger_reps, entity_reps):
         batch_size, trigger_num, _ = trigger_reps.shape
         batch_size, entity_num, _ = entity_reps.shape
-        sib_trigger_reps = self.trigger_sib_W(trigger_reps)   # B x T x k
+        sib_trigger_reps = self.trigger_sib_W(trigger_reps)  # B x T x k
         sib_trigger_reps = self.trigger_sib_dropout(sib_trigger_reps)
         sib_entity_reps = self.entity_sib_W(entity_reps)  # B x E x k
         sib_entity_reps = self.entity_sib_dropout(sib_entity_reps)
@@ -2418,10 +2997,10 @@ class OneIE(nn.Module):
         role_reps = self.role_type_sib_W
         role_num = role_reps.shape[0]
         # (B x T x R x R x E x E)
-        # 
+        #
         event_role_entity_factor = contract('bnk,rk,ek,bik,bjk-> bnreij', sib_trigger_reps, role_reps, role_reps,
                                             sib_entity_reps, sib_entity_reps)
-        # 
+        #
         # event_role_entity_factor = torch.reshape(event_role_entity_factor, (-1,entity_num,entity_num))
         # B x T x R x R x E x E
         event_role_entity_factor = event_role_entity_factor * \
@@ -2443,7 +3022,7 @@ class OneIE(nn.Module):
 
         # B x T x R x E x R x E -> B x T x E x E x R x R
         event_role_entity_factor = event_role_entity_factor.permute(0, 1, 3, 5, 2, 4)
-        # 
+        #
         # tre_pairs_mask: B x T x E x E
         tee_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, 1) * torch.unsqueeze(self.entity_masks, -1), 1) \
@@ -2451,7 +3030,6 @@ class OneIE(nn.Module):
         event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1), -1)
 
         return event_role_entity_factor
-
 
     # ------------------------------------------------------------------------------------------------
     def event_entity_coparent_factor_score(self, trigger_reps, entity_reps):
@@ -2464,10 +3042,10 @@ class OneIE(nn.Module):
         role_reps = self.role_type_cop_W
         role_num = role_reps.shape[0]
         # (B x E x R x R x T x T)
-        # 
+        #
         event_role_entity_factor = contract('bek,mk,nk,bik,bjk-> bemnij', cop_entity_reps, role_reps, role_reps,
                                             cop_trigger_reps, cop_trigger_reps)
-        
+
         # B x E x R x R x T x T
         event_role_entity_factor = event_role_entity_factor * torch.unsqueeze(torch.unsqueeze(
             torch.unsqueeze(torch.unsqueeze(
@@ -2488,7 +3066,7 @@ class OneIE(nn.Module):
 
         # B x E x R x T x R x T -> B x T x T x E x R x R
         event_role_entity_factor = event_role_entity_factor.permute(0, 3, 5, 1, 2, 4)
-        # 
+        #
         # tre_pairs_mask: B x T x T x E
         tte_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), 1) \
@@ -2497,15 +3075,16 @@ class OneIE(nn.Module):
 
         return event_role_entity_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def entity_relation_entity_factor_score(self, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
-        
+
         if self.config.new_potential:
             # breakpoint()
-            entity_relation_entity_factor = contract('tk,rk,vk->trv', self.entity_type_ere_W, self.relation_type_ere_W, self.entity_type_ere_W)
-            entity_relation_entity_factor = entity_relation_entity_factor.repeat(batch_size, entity_num, entity_num, 1, 1, 1)
+            entity_relation_entity_factor = contract('tk,rk,vk->trv', self.entity_type_ere_W, self.relation_type_ere_W,
+                                                     self.entity_type_ere_W)
+            entity_relation_entity_factor = entity_relation_entity_factor.repeat(batch_size, entity_num, entity_num, 1,
+                                                                                 1, 1)
         else:
             if self.config.relation_directional:
                 ere_entity_start_reps = self.entity_start_ere_W(entity_reps)  # B x E x k
@@ -2525,11 +3104,15 @@ class OneIE(nn.Module):
 
             # (B x E x E x 8 x 7 x 8) * (8 x 7 x 8) ere_valid_pattern_mask
             if self.config.relation_directional:
-                entity_relation_entity_factor = contract('bsk,bek,tk,rk,vk->bsetrv', ere_entity_start_reps, ere_entity_end_reps,
-                                                        ere_entity_type_reps, ere_relation_type_reps, ere_entity_type_reps)
+                entity_relation_entity_factor = contract('bsk,bek,tk,rk,vk->bsetrv', ere_entity_start_reps,
+                                                         ere_entity_end_reps,
+                                                         ere_entity_type_reps, ere_relation_type_reps,
+                                                         ere_entity_type_reps)
             else:
-                entity_relation_entity_factor = contract('bsk,bek,tk,rk,vk->bsetrv', ere_entity_start_reps, ere_entity_start_reps,
-                                                     ere_entity_type_reps, ere_relation_type_reps, ere_entity_type_reps)
+                entity_relation_entity_factor = contract('bsk,bek,tk,rk,vk->bsetrv', ere_entity_start_reps,
+                                                         ere_entity_start_reps,
+                                                         ere_entity_type_reps, ere_relation_type_reps,
+                                                         ere_entity_type_reps)
         # breakpoint()
         # if self.valid_relation_entity:
         #     ere_valid_pattern_mask = self.entity_relation_entity_factor_mask()
@@ -2562,7 +3145,6 @@ class OneIE(nn.Module):
 
         return entity_relation_entity_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def entity_relation_factor_score(self, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
@@ -2576,42 +3158,46 @@ class OneIE(nn.Module):
         else:
             relation_type_reps = self.relation_type_er_W  # 7 x k
 
-
         entity_type_num = entity_type_reps.shape[0]
         relation_type_num = relation_type_reps.shape[0]
 
         # (B x E x E x 8 x 7) * (8 x 7) re_valid_pattern_mask
         if self.config.test_er:
-            start_entity_relation_factor = contract('bsk,nk,rk->bsnr', er_start_entity_reps, entity_type_reps, relation_type_reps)
-            end_entity_relation_factor = contract('bsk,nk,rk->bsnr', er_end_entity_reps, entity_type_reps, relation_type_reps)
-            start_entity_relation_factor = torch.unsqueeze(start_entity_relation_factor,2).repeat(1,1,entity_num,1,1)
-            end_entity_relation_factor = torch.unsqueeze(end_entity_relation_factor,1).repeat(1,entity_num,1,1,1)
+            start_entity_relation_factor = contract('bsk,nk,rk->bsnr', er_start_entity_reps, entity_type_reps,
+                                                    relation_type_reps)
+            end_entity_relation_factor = contract('bsk,nk,rk->bsnr', er_end_entity_reps, entity_type_reps,
+                                                  relation_type_reps)
+            start_entity_relation_factor = torch.unsqueeze(start_entity_relation_factor, 2).repeat(1, 1, entity_num, 1,
+                                                                                                   1)
+            end_entity_relation_factor = torch.unsqueeze(end_entity_relation_factor, 1).repeat(1, entity_num, 1, 1, 1)
             # breakpoint()
             # er_pairs_mask: B x E x E
             ere_pairs_mask = torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1)
-            start_entity_relation_factor = start_entity_relation_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1), -1)
+            start_entity_relation_factor = start_entity_relation_factor * torch.unsqueeze(
+                torch.unsqueeze(ere_pairs_mask, -1), -1)
             start_entity_relation_factor = start_entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x 8 x 7 x E x E
             start_entity_relation_factor = start_entity_relation_factor * \
-                                    torch.unsqueeze(torch.unsqueeze(
-                                        torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                        (start_entity_relation_factor.device), 0), 0), 0)
+                                           torch.unsqueeze(torch.unsqueeze(
+                                               torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
+                                                               (start_entity_relation_factor.device), 0), 0), 0)
             start_entity_relation_factor = start_entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x E x E x 8 x 7
 
-            end_entity_relation_factor = end_entity_relation_factor * torch.unsqueeze(torch.unsqueeze(ere_pairs_mask, -1), -1)
+            end_entity_relation_factor = end_entity_relation_factor * torch.unsqueeze(
+                torch.unsqueeze(ere_pairs_mask, -1), -1)
             end_entity_relation_factor = end_entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x 8 x 7 x E x E
             end_entity_relation_factor = end_entity_relation_factor * \
-                                    torch.unsqueeze(torch.unsqueeze(
-                                        torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                        (end_entity_relation_factor.device), 0), 0), 0)
+                                         torch.unsqueeze(torch.unsqueeze(
+                                             torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
+                                                             (end_entity_relation_factor.device), 0), 0), 0)
             end_entity_relation_factor = end_entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x E x E x 8 x 7
             return start_entity_relation_factor, end_entity_relation_factor
         else:
             entity_relation_factor = contract('bsk,bek,nk,rk->bsenr', er_start_entity_reps, er_end_entity_reps,
-                                          entity_type_reps, relation_type_reps)
-        
+                                              entity_type_reps, relation_type_reps)
+
             # if self.valid_relation_entity:
             #     er_valid_pattern_mask = self.entity_relation_factor_mask()
-            #     er_valid_pattern_mask = er_valid_pattern_mask.to(entity_relation_factor.device) 
+            #     er_valid_pattern_mask = er_valid_pattern_mask.to(entity_relation_factor.device)
             #     entity_relation_factor = entity_relation_factor * torch.unsqueeze(
             #                                 torch.unsqueeze(torch.unsqueeze(er_valid_pattern_mask, 0), 0), 0)
 
@@ -2621,9 +3207,9 @@ class OneIE(nn.Module):
 
             entity_relation_factor = entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x 8 x 7 x E x E
             entity_relation_factor = entity_relation_factor * \
-                                    torch.unsqueeze(torch.unsqueeze(
-                                        torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
-                                                        (entity_relation_factor.device), 0), 0), 0)
+                                     torch.unsqueeze(torch.unsqueeze(
+                                         torch.unsqueeze(torch.ones(entity_num, entity_num).fill_diagonal_(0).to
+                                                         (entity_relation_factor.device), 0), 0), 0)
 
             if not self.config.relation_directional:
                 # symmetry
@@ -2631,22 +3217,21 @@ class OneIE(nn.Module):
                 entity_relation_factor = torch.triu(entity_relation_factor) + torch.transpose(
                     torch.triu(entity_relation_factor), 1, 2)
                 entity_relation_factor = torch.reshape(entity_relation_factor,
-                                                    (batch_size, entity_type_num, relation_type_num,
+                                                       (batch_size, entity_type_num, relation_type_num,
                                                         entity_num, entity_num))
 
             entity_relation_factor = entity_relation_factor.permute(0, 3, 4, 1, 2)  # B x E x E x 8 x 7
 
             return entity_relation_factor
 
-
     # ------------------------------------------------------------------------------------------------
     def entity_relation_gp_factor_score(self, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
         entity_start_gp_reps = self.entity_start_re_gp_W(entity_reps)  # B x E x k
         entity_start_gp_reps = self.gp_start_dropout(entity_start_gp_reps)
-        entity_mid_gp_reps = self.entity_mid_re_gp_W(entity_reps) # B x E x k
+        entity_mid_gp_reps = self.entity_mid_re_gp_W(entity_reps)  # B x E x k
         entity_mid_gp_reps = self.gp_mid_dropout(entity_mid_gp_reps)
-        entity_end_gp_reps = self.entity_end_re_gp_W(entity_reps) # B x E x k
+        entity_end_gp_reps = self.entity_end_re_gp_W(entity_reps)  # B x E x k
         entity_end_gp_reps = self.gp_end_dropout(entity_end_gp_reps)
         if self.config.decomp:
             entity_start_gp_reps = self.entity_start_re_gp_decomp_ffn(entity_start_gp_reps)
@@ -2660,28 +3245,30 @@ class OneIE(nn.Module):
         relation_num = relation_gp_reps.shape[0]
 
         # B x S x M x E x L1 x L2
-        entity_relation_gp_factor = contract('bsk,bmk,bek,ik,jk-> bsmeij', entity_start_gp_reps, entity_mid_gp_reps, entity_end_gp_reps,
-                                            relation_gp_reps, relation_gp_reps)
+        entity_relation_gp_factor = contract('bsk,bmk,bek,ik,jk-> bsmeij', entity_start_gp_reps, entity_mid_gp_reps,
+                                             entity_end_gp_reps,
+                                             relation_gp_reps, relation_gp_reps)
         eee_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, 1) * torch.unsqueeze(self.entity_masks, -1), 1) \
                            * torch.unsqueeze(torch.unsqueeze(self.entity_masks, -1), -1)
-        
+
         # B x S x M x E x L1 x L2
-        entity_relation_gp_factor = entity_relation_gp_factor * torch.unsqueeze(torch.unsqueeze(eee_triples_mask, -1), -1)                                        
-     
+        entity_relation_gp_factor = entity_relation_gp_factor * torch.unsqueeze(torch.unsqueeze(eee_triples_mask, -1),
+                                                                                -1)
+
         # B x S x L1 x L2 x M x E
-        entity_relation_gp_factor = entity_relation_gp_factor.permute((0,1,4,5,2,3)) * \
-                                                   torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
-                                                       torch.ones(entity_num, entity_num).to(
-                                                            entity_relation_gp_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
+        entity_relation_gp_factor = entity_relation_gp_factor.permute((0, 1, 4, 5, 2, 3)) * \
+                                    torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
+                                        torch.ones(entity_num, entity_num).to(
+                                            entity_relation_gp_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
 
         # B x E x L1 x L2 x S x M
-        entity_relation_gp_factor = entity_relation_gp_factor.permute((0,5,2,3,1,4)) * \
-                                                        torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
-                                                                torch.ones(entity_num, entity_num).to(
-                                                                    entity_relation_gp_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
+        entity_relation_gp_factor = entity_relation_gp_factor.permute((0, 5, 2, 3, 1, 4)) * \
+                                    torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
+                                        torch.ones(entity_num, entity_num).to(
+                                            entity_relation_gp_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
 
-        entity_relation_gp_factor = entity_relation_gp_factor.permute((0,4,5,1,2,3))
+        entity_relation_gp_factor = entity_relation_gp_factor.permute((0, 4, 5, 1, 2, 3))
 
         # # B x S x L1 x L2 x M x E
         # entity_relation_gp1_factor = torch.permute(entity_relation_gp_factor,(0,1,4,5,2,3)) * \
@@ -2691,92 +3278,91 @@ class OneIE(nn.Module):
         # # B x S x M x E x L1 x L2
         # entity_relation_gp1_factor = torch.permute(entity_relation_gp1_factor,(0,1,4,5,2,3))
         # B x S x M x E
-        
-        # entity_relation_gp1_factor = entity_relation_gp1_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1), -1)                                        
 
-        # # B x E x L1 x L2 x S x M         
+        # entity_relation_gp1_factor = entity_relation_gp1_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1), -1)
+
+        # # B x E x L1 x L2 x S x M
         # entity_relation_gp2_factor = torch.permute(entity_relation_gp_factor,(0,3,4,5,1,2)) * \
         #                                            torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
         #                                                 torch.ones(entity_num, entity_num).to(
         #                                                     entity_relation_gp_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
         # # B x S x M x E x L1 x L2
         # entity_relation_gp2_factor = torch.permute(entity_relation_gp2_factor,(0,4,5,1,2,3))
-        
+
         # entity_relation_gp2_factor = entity_relation_gp2_factor * torch.unsqueeze(torch.unsqueeze(tte_triples_mask, -1), -1)
 
         return entity_relation_gp_factor
 
-
     # ------------------------------------------------------------------------------------------------
-    def entity_relation_sib_factor_score(self, entity_reps):    
+    def entity_relation_sib_factor_score(self, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
         # breakpoint()
         entity_start_sib_reps = self.entity_start_re_sib_W(entity_reps)  # B x E x k
         entity_start_sib_reps = self.sib_start_dropout(entity_start_sib_reps)
-        
-        entity_end_sib_reps = self.entity_end_re_sib_W(entity_reps) # B x E x k
+
+        entity_end_sib_reps = self.entity_end_re_sib_W(entity_reps)  # B x E x k
         entity_end_sib_reps = self.sib_end_dropout(entity_end_sib_reps)
         if self.config.decomp:
             entity_start_sib_reps = self.entity_start_re_sib_decomp_ffn(entity_start_sib_reps)
             entity_end_sib_reps = self.entity_end_re_sib_decomp_ffn(entity_end_sib_reps)
 
-
         if self.config.share_relation_type_reps:
             relation_sib_reps = self.relation_type_re_sib_W(self.unary_relation_type_reps)
         else:
             relation_sib_reps = self.relation_type_re_sib_W
-            #---------------------------------------------------------------------------
+            # ---------------------------------------------------------------------------
             # relation_sib_reps = self.relation_type_sib_dropout(relation_sib_reps)
-            #---------------------------------------------------------------------------
+            # ---------------------------------------------------------------------------
         # self.debug['relation_reps'] = relation_reps
         relation_num = relation_sib_reps.shape[0]
         # (B x E x R x R x E x E)
-        # 
-        entity_relation_sib_factor = contract('bnk,rk,ek,bik,bjk-> bnreij', entity_start_sib_reps, relation_sib_reps, relation_sib_reps,
-                                            entity_end_sib_reps, entity_end_sib_reps)
-        # 
+        #
+        entity_relation_sib_factor = contract('bnk,rk,ek,bik,bjk-> bnreij', entity_start_sib_reps, relation_sib_reps,
+                                              relation_sib_reps,
+                                              entity_end_sib_reps, entity_end_sib_reps)
+        #
         # event_role_entity_factor = torch.reshape(event_role_entity_factor, (-1,entity_num,entity_num))
         # B x T x R x R x E x E
         entity_relation_sib_factor = entity_relation_sib_factor * \
-                                   torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
-                                       torch.ones(entity_num, entity_num).to(
-                                           entity_relation_sib_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
+                                     torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(
+                                         torch.ones(entity_num, entity_num).to(
+                                             entity_relation_sib_factor.device).fill_diagonal_(0), 0), 0), 0), 0)
 
         # B x E x R x E x R x E
         entity_relation_sib_factor = torch.transpose(entity_relation_sib_factor, 3, 4)
         # B*E x R*E x R*E
         entity_relation_sib_factor = torch.reshape(entity_relation_sib_factor,
-                                                 (-1, entity_num * relation_num, entity_num * relation_num))
+                                                   (-1, entity_num * relation_num, entity_num * relation_num))
         # btr_1e_1r_2e_2 = btr_2e_2r_1e_1 : bt3122 = bt2231
         entity_relation_sib_factor = torch.triu(entity_relation_sib_factor) + torch.transpose(
             torch.triu(entity_relation_sib_factor), 1, 2)
         # B x E x R x E x R x E
         entity_relation_sib_factor = torch.reshape(entity_relation_sib_factor,
-                                                 (batch_size, entity_num, relation_num, entity_num, relation_num, entity_num))
+                                                   (batch_size, entity_num, relation_num, entity_num, relation_num,
+                                                    entity_num))
 
         # B x E x R x E x R x E -> B x E x E x E x R x R
         entity_relation_sib_factor = entity_relation_sib_factor.permute(0, 1, 3, 5, 2, 4)
-        # 
+        #
         # tre_pairs_mask: B x E x E x E
         tee_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, 1) * torch.unsqueeze(self.entity_masks, -1), 1) \
                            * torch.unsqueeze(torch.unsqueeze(self.entity_masks, -1), -1)
-        entity_relation_sib_factor = entity_relation_sib_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1), -1)
+        entity_relation_sib_factor = entity_relation_sib_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1),
+                                                                                  -1)
 
         return entity_relation_sib_factor
 
-
     # ------------------------------------------------------------------------------------------------
-    def entity_relation_cop_factor_score(self, entity_reps): 
+    def entity_relation_cop_factor_score(self, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
         entity_start_cop_reps = self.entity_start_re_cop_W(entity_reps)  # B x E x k
         entity_start_cop_reps = self.cop_start_dropout(entity_start_cop_reps)
-        entity_end_cop_reps = self.entity_end_re_cop_W(entity_reps) # B x E x k
+        entity_end_cop_reps = self.entity_end_re_cop_W(entity_reps)  # B x E x k
         entity_end_cop_reps = self.cop_end_dropout(entity_end_cop_reps)
         if self.config.decomp:
             entity_start_cop_reps = self.entity_start_re_cop_decomp_ffn(entity_start_cop_reps)
             entity_end_cop_reps = self.entity_end_re_cop_decomp_ffn(entity_end_cop_reps)
-
 
         if self.config.share_relation_type_reps:
             relation_cop_reps = self.relation_type_re_cop_W(self.unary_relation_type_reps)
@@ -2784,10 +3370,11 @@ class OneIE(nn.Module):
             relation_cop_reps = self.relation_type_re_cop_W
         relation_num = relation_cop_reps.shape[0]
         # (B x E x R x R x T x T)
-        # 
-        entity_relation_cop_factor = contract('bek,mk,nk,bik,bjk-> bemnij', entity_end_cop_reps, relation_cop_reps, relation_cop_reps,
-                                            entity_start_cop_reps, entity_start_cop_reps)
-        
+        #
+        entity_relation_cop_factor = contract('bek,mk,nk,bik,bjk-> bemnij', entity_end_cop_reps, relation_cop_reps,
+                                              relation_cop_reps,
+                                              entity_start_cop_reps, entity_start_cop_reps)
+
         # B x E x R x R x T x T
         entity_relation_cop_factor = entity_relation_cop_factor * torch.unsqueeze(torch.unsqueeze(
             torch.unsqueeze(torch.unsqueeze(
@@ -2797,36 +3384,37 @@ class OneIE(nn.Module):
         entity_relation_cop_factor = torch.transpose(entity_relation_cop_factor, 3, 4)
         # B*E x R*T x R*T
         entity_relation_cop_factor = torch.reshape(entity_relation_cop_factor,
-                                                 (-1, entity_num * relation_num, entity_num * relation_num))
+                                                   (-1, entity_num * relation_num, entity_num * relation_num))
         # btr_1e_1r_2e_2 = btr_2e_2r_1e_1 : bt3122 = bt2231
         entity_relation_cop_factor = torch.triu(entity_relation_cop_factor) + torch.transpose(
             torch.triu(entity_relation_cop_factor), 1, 2)
 
         # B x E x R x T x R x T
         entity_relation_cop_factor = torch.reshape(entity_relation_cop_factor,
-                                                 (batch_size, entity_num, relation_num, entity_num, relation_num, entity_num))
+                                                   (batch_size, entity_num, relation_num, entity_num, relation_num,
+                                                    entity_num))
 
         # B x E x R x T x R x T -> B x T x T x E x R x R
         entity_relation_cop_factor = entity_relation_cop_factor.permute(0, 3, 5, 1, 2, 4)
-        # 
+        #
         # tre_pairs_mask: B x T x T x E
         tte_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), 1) \
                            * torch.unsqueeze(torch.unsqueeze(self.entity_masks, -1), -1)
-        entity_relation_cop_factor = entity_relation_cop_factor * torch.unsqueeze(torch.unsqueeze(tte_triples_mask, -1), -1)
+        entity_relation_cop_factor = entity_relation_cop_factor * torch.unsqueeze(torch.unsqueeze(tte_triples_mask, -1),
+                                                                                  -1)
 
         return entity_relation_cop_factor
 
-
     # ------------------------------------------------------------------------------------------------
-    def event_relation_cop_factor_score(self, trigger_reps, entity_reps): 
+    def event_relation_cop_factor_score(self, trigger_reps, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
         batch_size, trigger_num, _ = trigger_reps.shape
         trigger_start_cop_reps = self.trigger_start_re_cop_W(trigger_reps)  # B x T x k
         trigger_start_cop_reps = self.cop_trigger_start_dropout(trigger_start_cop_reps)
         entity_start_cop_reps = self.entity_start_re_cop_W(entity_reps)  # B x E x k
         entity_start_cop_reps = self.cop_start_dropout(entity_start_cop_reps)
-        entity_end_cop_reps = self.entity_end_re_cop_W(entity_reps) # B x E x k
+        entity_end_cop_reps = self.entity_end_re_cop_W(entity_reps)  # B x E x k
         entity_end_cop_reps = self.cop_end_dropout(entity_end_cop_reps)
         if self.config.decomp:
             entity_start_cop_reps = self.entity_start_re_cop_decomp_ffn(entity_start_cop_reps)
@@ -2841,28 +3429,29 @@ class OneIE(nn.Module):
         relation_num = relation_cop_reps.shape[0]
         role_num = role_cop_reps.shape[0]
         # (B x T x E x E x R1 x R2 )
-        
+
         # breakpoint()
-        event_relation_cop_factor = contract('bik,bjk,bek,mk,nk->bijemn',trigger_start_cop_reps, entity_start_cop_reps, entity_end_cop_reps,role_cop_reps, relation_cop_reps)
-    
+        event_relation_cop_factor = contract('bik,bjk,bek,mk,nk->bijemn', trigger_start_cop_reps, entity_start_cop_reps,
+                                             entity_end_cop_reps, role_cop_reps, relation_cop_reps)
+
         # tre_pairs_mask: B x T x E x E
         tee_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, 1) * torch.unsqueeze(self.entity_masks, -1), 1) \
                            * torch.unsqueeze(torch.unsqueeze(self.trigger_masks, -1), -1)
-        event_relation_cop_factor = event_relation_cop_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1), -1)
+        event_relation_cop_factor = event_relation_cop_factor * torch.unsqueeze(torch.unsqueeze(tee_triples_mask, -1),
+                                                                                -1)
 
         return event_relation_cop_factor
 
-
     # ------------------------------------------------------------------------------------------------
-    def event_relation_gp_factor_score(self, trigger_reps, entity_reps): 
+    def event_relation_gp_factor_score(self, trigger_reps, entity_reps):
         batch_size, entity_num, _ = entity_reps.shape
         batch_size, trigger_num, _ = trigger_reps.shape
         trigger_start_gp_reps = self.trigger_start_re_gp_W(trigger_reps)  # B x T x k
         trigger_start_gp_reps = self.gp_trigger_start_dropout(trigger_start_gp_reps)
         entity_start_gp_reps = self.entity_start_re_gp_W(entity_reps)  # B x E x k
         entity_start_gp_reps = self.gp_start_dropout(entity_start_gp_reps)
-        entity_end_gp_reps = self.entity_end_re_gp_W(entity_reps) # B x E x k
+        entity_end_gp_reps = self.entity_end_re_gp_W(entity_reps)  # B x E x k
         entity_end_gp_reps = self.gp_end_dropout(entity_end_gp_reps)
 
         relation_gp_reps = self.relation_type_re_gp_W
@@ -2871,10 +3460,11 @@ class OneIE(nn.Module):
         relation_num = relation_gp_reps.shape[0]
         role_num = role_gp_reps.shape[0]
         # (B x T x E x E x R1 x R2 )
-        # 
-        event_relation_gp_factor = contract('bik,bsk,bek,mk,nk-> bisemn',trigger_start_gp_reps, entity_start_gp_reps, entity_end_gp_reps, 
+        #
+        event_relation_gp_factor = contract('bik,bsk,bek,mk,nk-> bisemn', trigger_start_gp_reps, entity_start_gp_reps,
+                                            entity_end_gp_reps,
                                             role_gp_reps, relation_gp_reps)
-    
+
         # tre_pairs_mask: B x T x E x E
         tee_triples_mask = torch.unsqueeze(
             torch.unsqueeze(self.entity_masks, 1) * torch.unsqueeze(self.entity_masks, -1), 1) \
@@ -2883,18 +3473,14 @@ class OneIE(nn.Module):
 
         return event_relation_gp_factor
 
-    def variational_lower_bound(alpha, observations):
-        q = Dirichlet(alpha)  # 获取狄利克雷分布
-        log_q = q.log_prob(q.sample())  # 计算q的对数
-        log_p = (observations - 1) * log_q  # 计算观测的对数似然
-        return torch.sum(log_p) - torch.sum(log_q)  # 变分下界
-
     # ------------------------------------------------------------------------------------------------
-    def mfvi(self, event_logits, role_logits, entity_logits, relation_logits, event_role_factor=None,
-             role_entity_factor=None,event_role_entity_factor=None, event_role_sibling_factor=None, 
-             event_role_cop_factor=None,entity_relation_entity_factor=None, entity_relation_factor=None,relation_entity_factor=None,
-             entity_relation_sib_factor=None,entity_relation_cop_factor=None,entity_relation_gp_factor=None,start_entity_relation_factor=None,
-             end_entity_relation_factor=None,event_relation_cop_factor = None, event_relation_gp_factor = None):
+    def sgvi(self, event_logits, role_logits, entity_logits, relation_logits, event_role_factor=None,
+             role_entity_factor=None, event_role_entity_factor=None, event_role_sibling_factor=None,
+             event_role_cop_factor=None, entity_relation_entity_factor=None, entity_relation_factor=None,
+             relation_entity_factor=None,
+             entity_relation_sib_factor=None, entity_relation_cop_factor=None, entity_relation_gp_factor=None,
+             start_entity_relation_factor=None,
+             end_entity_relation_factor=None, event_relation_cop_factor=None, event_relation_gp_factor=None):
         """
                 :param event_logits: B x |T| x (33+1)
                 :param role_logits: B x |T|*|E| x (22+1)
@@ -2909,22 +3495,18 @@ class OneIE(nn.Module):
         event_q = event_logits
         role_q = role_logits
         relation_q = relation_logits
-        print("entity_q :", entity_q)
-        # print("event_q :", event_q)
-        # print("role_q :", role_q)
-        # print("relation_q :", relation_q)
         # self.debug['relation_unary'] = relation_logits
 
         for i in range(self.config.mfvi_iter):
-        # for i in range(0):
+            # for i in range(0):
             if self.config.asynchronous:
-                
-                entity_q = torch.nn.functional.softmax(entity_q, dim=-1)* torch.unsqueeze(self.entity_masks, -1)
-        
+
+                entity_q = torch.nn.functional.softmax(entity_q, dim=-1) * torch.unsqueeze(self.entity_masks, -1)
+
                 # Relation Extraction----------------------------------------------------
                 if self.use_high_order_ere and entity_relation_entity_factor is not None:
                     relation_ere_F = contract('bijern,bie,bjn->bijr', entity_relation_entity_factor, entity_q, entity_q)
-                    #---------sib or cop to refine relation---------------------------------
+                    # ---------sib or cop to refine relation---------------------------------
                     if self.use_high_order_re_sibling and entity_relation_sib_factor is not None:
                         relation_sib_F = contract('btnmlr, btnl->btmr', entity_relation_sib_factor, relation_q)
                     else:
@@ -2934,18 +3516,21 @@ class OneIE(nn.Module):
                     else:
                         relation_cop_F = 0
 
-                    relation_q = relation_logits+relation_ere_F + relation_sib_F + relation_cop_F
+                    relation_q = relation_logits + relation_ere_F + relation_sib_F + relation_cop_F
                     relation_q_p = torch.nn.functional.softmax(relation_q, dim=-1) * torch.unsqueeze(
-                                torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
+                        torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                     entity_start_ere_F = contract('bijern,bjn,bijr->bie', entity_relation_entity_factor, entity_q,
-                                                    relation_q_p)
+                                                  relation_q_p)
                     entity_end_ere_F = contract('bijern,bie,bijr->bjn', entity_relation_entity_factor, entity_q,
-                                                    relation_q_p)
-                    entity_q = (entity_logits + 0.5*entity_start_ere_F + 0.5*entity_end_ere_F)
-                if self.use_high_order_er and (entity_relation_factor is not None or start_entity_relation_factor is not None):
+                                                relation_q_p)
+                    entity_q = (entity_logits + 0.5 * entity_start_ere_F + 0.5 * entity_end_ere_F)
+                if self.use_high_order_er and (
+                        entity_relation_factor is not None or start_entity_relation_factor is not None):
                     if self.config.new_potential:
-                        relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor, entity_q) # B x E x E x EL x RL
-                        relation_er_F2 = contract('bijre,bje->bijr', relation_entity_factor, entity_q) # B x E x E x RL x EL
+                        relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor,
+                                                  entity_q)  # B x E x E x EL x RL
+                        relation_er_F2 = contract('bijre,bje->bijr', relation_entity_factor,
+                                                  entity_q)  # B x E x E x RL x EL
                         relation_q = (relation_logits + relation_er_F1 + relation_er_F2)
                         relation_q_p = torch.nn.functional.softmax(relation_q, dim=-1) * torch.unsqueeze(
                             torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
@@ -2961,26 +3546,25 @@ class OneIE(nn.Module):
                             relation_q_p = torch.nn.functional.softmax(relation_q, dim=-1) * torch.unsqueeze(
                                 torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                             entity_er_F1 = contract('bijer,bijr->bie', start_entity_relation_factor, relation_q_p)
-                            entity_er_F2 =  contract('bijer,bijr->bje', end_entity_relation_factor, relation_q_p)
+                            entity_er_F2 = contract('bijer,bijr->bje', end_entity_relation_factor, relation_q_p)
                             entity_q = (entity_logits + entity_er_F1 + entity_er_F2)
                         else:
                             relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor, entity_q)
                             # relation_er_F2 = contract('bijer,bje->bijr', entity_relation_factor, entity_q)
-                            relation_q = relation_logits + relation_er_F1 #+ relation_er_F2)
+                            relation_q = relation_logits + relation_er_F1  # + relation_er_F2)
                             relation_q_p = torch.nn.functional.softmax(relation_q, dim=-1) * torch.unsqueeze(
                                 torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                             entity_er_F1 = contract('bijer,bijr->bie', entity_relation_factor, relation_q_p)
-                            entity_er_F2 =  contract('bijer,bijr->bje', entity_relation_factor, relation_q_p)
+                            entity_er_F2 = contract('bijer,bijr->bje', entity_relation_factor, relation_q_p)
                             entity_q = (entity_logits + entity_er_F1 + entity_er_F2)
                         # breakpoint()
-            
 
                 # Event Extraction----------------------------------------------------
                 if self.use_high_order_tre and event_role_entity_factor is not None:
                     role_tre_F = contract('bnmtre, bnt, bme -> bnmr', event_role_entity_factor, event_q,
-                                            entity_q)  # B x T x E x 23
-                    
-                    #---------sib to refine role---------------------------------
+                                          entity_q)  # B x T x E x 23
+
+                    # ---------sib to refine role---------------------------------
                     if self.use_high_order_sibling and event_role_sibling_factor is not None:
                         role_tre_sib_F = contract('btnmlr, btnl->btmr', event_role_sibling_factor, role_q)
                     else:
@@ -2989,73 +3573,72 @@ class OneIE(nn.Module):
                     role_q = role_logits + self.alpha_role_tre * role_tre_F + self.alpha_role_sib * role_tre_sib_F
                     # role_q = role_logits + self.config.alpha_role_sib * role_tre_sib_F
                     role_q_p = torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
-                            torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
+                        torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                     event_tre_F = contract('bnmtre, bnmr, bme -> bnt', event_role_entity_factor,
-                                                # *torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(self.event_role_entity_factor_mask_nonrole().to(event_role_entity_factor.device),0),0),0), 
-                                                role_q_p,
-                                                entity_q)  # B x T x 34
+                                           # *torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(self.event_role_entity_factor_mask_nonrole().to(event_role_entity_factor.device),0),0),0),
+                                           role_q_p,
+                                           entity_q)  # B x T x 34
                     entity_tre_F = contract('bnmtre, bnt, bnmr -> bme', event_role_entity_factor,
-                                                # *torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(self.event_role_entity_factor_mask_nonrole().to(event_role_entity_factor.device),0),0),0), 
-                                                event_q,
-                                                role_q_p)  # B x E x 8
-                    event_q = event_logits + self.alpha_event_tre*event_tre_F
-                    entity_q = entity_logits + self.alpha_entity_tre*entity_tre_F
+                                            # *torch.unsqueeze(torch.unsqueeze(torch.unsqueeze(self.event_role_entity_factor_mask_nonrole().to(event_role_entity_factor.device),0),0),0),
+                                            event_q,
+                                            role_q_p)  # B x E x 8
+                    event_q = event_logits + self.alpha_event_tre * event_tre_F
+                    entity_q = entity_logits + self.alpha_entity_tre * entity_tre_F
                     # breakpoint()
 
             else:
                 if self.config.prob_damp:
                     if i == 0:
-                        former_entity_q = torch.nn.functional.softmax(entity_q, dim=-1)* torch.unsqueeze(self.entity_masks, -1)
+                        former_entity_q = torch.nn.functional.softmax(entity_q, dim=-1) * torch.unsqueeze(
+                            self.entity_masks, -1)
                         former_role_q = torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
-                                        torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
+                            torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
 
-                    entity_q = 0.5*torch.nn.functional.softmax(entity_q, dim=-1)* torch.unsqueeze(self.entity_masks, -1)+0.5*former_entity_q
-                    role_q = 0.5*torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
-                            torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)+0.5*former_role_q
+                    entity_q = 0.5 * torch.nn.functional.softmax(entity_q, dim=-1) * torch.unsqueeze(self.entity_masks,
+                                                                                                     -1) + 0.5 * former_entity_q
+                    role_q = 0.5 * torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
+                        torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1),
+                        -1) + 0.5 * former_role_q
 
                     former_entity_q = entity_q
                     former_role_q = role_q
                     # breakpoint()
                 else:
-                    entity_q = torch.nn.functional.softmax(entity_q, dim=-1)* torch.unsqueeze(self.entity_masks, -1)
+                    entity_q = torch.nn.functional.softmax(entity_q, dim=-1) * torch.unsqueeze(self.entity_masks, -1)
                     # entity_q = Sparsemax()(entity_q)
                     role_q = torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
-                            torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
+                        torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                     # role_q = Sparsemax()(role_q) * torch.unsqueeze(
                     #     torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
                 event_q = torch.nn.functional.softmax(event_q, dim=-1) * torch.unsqueeze(self.trigger_masks, -1)
-                relation_q = torch.nn.functional.softmax(relation_q, dim=-1)* torch.unsqueeze(
+                relation_q = torch.nn.functional.softmax(relation_q, dim=-1) * torch.unsqueeze(
                     torch.unsqueeze(self.entity_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
-                
 
                 if self.use_high_order_tl and event_role_factor is not None:
                     # breakpoint()
-                    event_tl_F = contract('bnmtl, bnml -> bnt', event_role_factor, role_q) # B x T x 34
-                    role_tl_F = contract('bnmtl, bnt -> bnml', event_role_factor, event_q) # B x T x E x 23
+                    event_tl_F = contract('bnmtl, bnml -> bnt', event_role_factor, role_q)  # B x T x 34
+                    role_tl_F = contract('bnmtl, bnt -> bnml', event_role_factor, event_q)  # B x T x E x 23
                 else:
-                    event_tl_F = 0 
+                    event_tl_F = 0
                     role_tl_F = 0
 
                 if self.use_high_order_le and role_entity_factor is not None:
-                    role_le_F = contract('bnmle, bme -> bnml', role_entity_factor, entity_q) # B x T x E x 23
-                    entity_le_F = contract('bnmle, bnml -> bme', role_entity_factor, role_q) # B x E x 8
-                    # breakpoint()     
+                    role_le_F = contract('bnmle, bme -> bnml', role_entity_factor, entity_q)  # B x T x E x 23
+                    entity_le_F = contract('bnmle, bnml -> bme', role_entity_factor, role_q)  # B x E x 8
+                    # breakpoint()
                 else:
                     role_le_F = 0
                     entity_le_F = 0
-                
+
                 # self.use_high_order_tre = False
                 if self.use_high_order_tre and event_role_entity_factor is not None:
-                    print("event_role_entity_factor",event_role_entity_factor.shape)
-                    print("role_q",role_q.shape)
-                    print("entity_q",entity_q.shape)
                     event_tre_F = contract('bnmtre, bnmr, bme -> bnt', event_role_entity_factor, role_q,
-                                        entity_q)  # B x T x 34
+                                           entity_q)  # B x T x 34
                     role_tre_F = contract('bnmtre, bnt, bme -> bnmr', event_role_entity_factor, event_q,
-                                        entity_q)  # B x T x E x 23
+                                          entity_q)  # B x T x E x 23
                     entity_tre_F = contract('bnmtre, bnt, bnmr -> bme', event_role_entity_factor, event_q,
                                             role_q)  # B x E x 8
-                    # 
+                    #
                 else:
                     event_tre_F = 0
                     role_tre_F = 0
@@ -3069,8 +3652,8 @@ class OneIE(nn.Module):
                     role_tre_sibling_F = 0
 
                 if self.use_high_order_coparent and event_role_cop_factor is not None:
-                    # 
-                    role_tre_cop_F = contract('btselr, bser->btel', event_role_cop_factor, role_q)                
+                    #
+                    role_tre_cop_F = contract('btselr, bser->btel', event_role_cop_factor, role_q)
                 else:
                     role_tre_cop_F = 0
 
@@ -3078,12 +3661,12 @@ class OneIE(nn.Module):
                     relation_ere_F = contract('bijern,bie,bjn->bijr', entity_relation_entity_factor, entity_q, entity_q)
                     if self.config.relation_directional:
                         entity_start_ere_F = contract('bijern,bjn,bijr->bie', entity_relation_entity_factor, entity_q,
-                                                    relation_q)
+                                                      relation_q)
                         entity_end_ere_F = contract('bijern,bie,bijr->bjn', entity_relation_entity_factor, entity_q,
                                                     relation_q)
                     else:
                         entity_start_ere_F = contract('bijern,bjn,bijr->bie', entity_relation_entity_factor, entity_q,
-                                                    relation_q)
+                                                      relation_q)
                         entity_end_ere_F = 0
                 else:
                     relation_ere_F = 0
@@ -3092,15 +3675,17 @@ class OneIE(nn.Module):
 
                 if self.use_high_order_er and entity_relation_factor is not None:
                     if self.config.new_potential:
-                        relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor, entity_q) # B x E x E x EL x RL
-                        relation_er_F2 = contract('bijre,bje->bijr', relation_entity_factor, entity_q) # B x E x E x RL x EL
+                        relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor,
+                                                  entity_q)  # B x E x E x EL x RL
+                        relation_er_F2 = contract('bijre,bje->bijr', relation_entity_factor,
+                                                  entity_q)  # B x E x E x RL x EL
                         entity_er_F1 = contract('bijer,bijr->bie', entity_relation_factor, relation_q)
                         entity_er_F2 = contract('bijre,bijr->bje', relation_entity_factor, relation_q)
                     else:
                         relation_er_F1 = contract('bijer,bie->bijr', entity_relation_factor, entity_q)
                         relation_er_F2 = contract('bijer,bje->bijr', entity_relation_factor, entity_q)
                         entity_er_F1 = contract('bijer,bijr->bie', entity_relation_factor, relation_q)
-                        entity_er_F2 =  contract('bijer,bijr->bje', entity_relation_factor, relation_q)
+                        entity_er_F2 = contract('bijer,bijr->bje', entity_relation_factor, relation_q)
                         # breakpoint()
                         # entity_er_F1 = 0
                         # entity_er_F2 = 0
@@ -3145,14 +3730,14 @@ class OneIE(nn.Module):
 
                 if self.use_high_order_rr_coparent and event_relation_cop_factor is not None:
                     # breakpoint()
-                    role_rel_cop_F = contract('btserl, bsel->bter', event_relation_cop_factor, relation_q) 
+                    role_rel_cop_F = contract('btserl, bsel->bter', event_relation_cop_factor, relation_q)
                     rel_role_cop_F = contract('btserl, bter->bsel', event_relation_cop_factor, role_q)
                 else:
                     role_rel_cop_F = 0
                     rel_role_cop_F = 0
 
                 if self.use_high_order_rr_grandparent and event_relation_gp_factor is not None:
-                    role_rel_gp_F = contract('btserl, bsel->btsr', event_relation_gp_factor, relation_q) 
+                    role_rel_gp_F = contract('btserl, bsel->btsr', event_relation_gp_factor, relation_q)
                     rel_role_gp_F = contract('btserl, btsr->bsel', event_relation_gp_factor, role_q)
                 else:
                     role_rel_gp_F = 0
@@ -3163,20 +3748,21 @@ class OneIE(nn.Module):
                         former_role_le_F = role_le_F
                         former_entity_le_F = entity_le_F
 
-                    event_q = event_logits + event_tre_F + event_tl_F 
-                    role_q = role_logits + role_tre_F + role_tl_F + (0.5*role_le_F+0.5*former_role_le_F) + role_tre_sibling_F + role_tre_cop_F 
-                    entity_q = entity_logits + entity_tre_F + (0.5*entity_le_F+0.5*former_entity_le_F) + entity_start_ere_F + entity_end_ere_F + entity_er_F
+                    event_q = event_logits + event_tre_F + event_tl_F
+                    role_q = role_logits + role_tre_F + role_tl_F + (
+                                0.5 * role_le_F + 0.5 * former_role_le_F) + role_tre_sibling_F + role_tre_cop_F
+                    entity_q = entity_logits + entity_tre_F + (
+                                0.5 * entity_le_F + 0.5 * former_entity_le_F) + entity_start_ere_F + entity_end_ere_F + entity_er_F
                     relation_q = relation_logits + relation_ere_F + relation_er_F1 + relation_er_F2 + relation_sib_F + relation_cop_F
-                    
+
                     former_role_le_F = role_le_F
                     former_entity_le_F = entity_le_F
                 else:
                     # breakpoint()
-                    event_q = event_logits + event_tre_F + event_tl_F 
-                    role_q = role_logits + role_rel_cop_F + role_rel_gp_F + role_tre_F + role_tl_F + role_le_F + self.config.alpha_role_sib*role_tre_sibling_F + self.config.alpha_role_cop*role_tre_cop_F 
+                    event_q = event_logits + event_tre_F + event_tl_F
+                    role_q = role_logits + role_rel_cop_F + role_rel_gp_F + role_tre_F + role_tl_F + role_le_F + self.config.alpha_role_sib * role_tre_sibling_F + self.config.alpha_role_cop * role_tre_cop_F
                     entity_q = entity_logits + entity_tre_F + entity_le_F + entity_start_ere_F + entity_end_ere_F + entity_er_F1 + entity_er_F2
                     relation_q = relation_logits + rel_role_cop_F + rel_role_gp_F + relation_ere_F + relation_er_F1 + relation_er_F2 + relation_sib_F + relation_cop_F + relation_gp1_F + relation_gp2_F
-
 
             # if self.config.scaled:
             #     breakpoint()
@@ -3184,18 +3770,18 @@ class OneIE(nn.Module):
             #     role_q = role_q / 5
             #     event_q = event_q / 5
             #     relation_q = relation_q / 5
-        
+
         # role_q_test = torch.nn.functional.softmax(role_q, dim=-1) * torch.unsqueeze(
         #     torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1)
         # entity_q_test= torch.nn.functional.softmax(entity_q, dim=-1)* torch.unsqueeze(self.entity_masks, -1)
-        
+
         # test_potential = torch.sum(
         #     role_entity_factor*torch.unsqueeze(role_q_test,-1)
         #     *torch.unsqueeze(torch.unsqueeze(entity_q_test,1),-2),dim=(0,1,2))/torch.sum(torch.unsqueeze(
         #     torch.unsqueeze(self.trigger_masks, -1) * torch.unsqueeze(self.entity_masks, 1), -1))
         # self.test_potential.append(test_potential)
         # breakpoint()
-       
+
         # breakpoint()
         role_q = torch.reshape(role_q, (batch_size, trigger_num * entity_num, -1))
         relation_q = torch.reshape(relation_q, (batch_size, entity_num * entity_num, -1))
@@ -3246,7 +3832,7 @@ class Ident(nn.Module):
             self.bert = RobertaModel(bert_config)
         elif 'scibert' in config.bert_model_name:
             # breakpoint()
-            self.bert = BertModel(bert_config) 
+            self.bert = BertModel(bert_config)
         else:
             self.bert = BertModel(bert_config)
         self.bert_dropout = nn.Dropout(p=config.bert_dropout)
@@ -3261,13 +3847,10 @@ class Ident(nn.Module):
         self.trigger_label_ffn = nn.Linear(self.bert_dim, self.trigger_label_num,
                                            bias=linear_bias)
 
-
         # others
         self.entity_crf = CRF(self.entity_label_stoi, bioes=False)
         self.trigger_crf = CRF(self.trigger_label_stoi, bioes=False)
         self.pad_vector = nn.Parameter(torch.randn(1, 1, self.bert_dim))
-
-
 
     def load_bert(self, name, cache_dir=None):
         """Load the pre-trained BERT model (used in training phrase)
@@ -3276,19 +3859,19 @@ class Ident(nn.Module):
         """
         print('Loading pre-trained BERT model {}'.format(name))
         if 'scibert' in name:
-            self.bert = AutoModel.from_pretrained(name,cache_dir=cache_dir)
+            self.bert = AutoModel.from_pretrained(name, cache_dir=cache_dir)
         elif 'albert' in name:
             self.bert = AlbertModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                                )
+                                                    cache_dir=cache_dir,
+                                                    )
         elif 'roberta' in name:
             self.bert = RobertaModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                                )
+                                                     cache_dir=cache_dir,
+                                                     )
         else:
             self.bert = BertModel.from_pretrained(name,
-                                              cache_dir=cache_dir,
-                                              output_hidden_states=True)
+                                                  cache_dir=cache_dir,
+                                                  output_hidden_states=True)
 
     def encode(self, piece_idxs, attention_masks, token_lens):
         """Encode input sequences with BERT
@@ -3297,7 +3880,7 @@ class Ident(nn.Module):
         :param token_lens (list): token lengths
         """
         batch_size, _ = piece_idxs.size()
-        all_bert_outputs = self.bert(piece_idxs, attention_mask=attention_masks,output_hidden_states=True)
+        all_bert_outputs = self.bert(piece_idxs, attention_mask=attention_masks, output_hidden_states=True)
         bert_outputs = all_bert_outputs[0]
 
         if self.use_extra_bert:
@@ -3363,7 +3946,6 @@ class Ident(nn.Module):
                                    batch.token_lens)
         batch_size, _, _ = bert_outputs.size()
 
-
         # identification
         entity_label_scores = self.entity_label_ffn(bert_outputs)
         entity_label_scores = self.entity_crf.pad_logits(entity_label_scores)
@@ -3380,9 +3962,8 @@ class Ident(nn.Module):
                                       batch.token_nums,
                                       self.trigger_label_stoi)
 
-        # 
+        #
         batch_graphs = [{'entity': entities[i], 'trigger': triggers[i]} for i in range(len(entities))]
-
 
         self.train()
         return batch_graphs
@@ -3395,7 +3976,6 @@ class Ident(nn.Module):
                                    batch.token_lens)
         batch_size, _, _ = bert_outputs.size()
 
-
         # identification
         entity_label_scores = self.entity_label_ffn(bert_outputs)
         entity_label_scores = self.entity_crf.pad_logits(entity_label_scores)
@@ -3412,7 +3992,7 @@ class Ident(nn.Module):
                                       batch.token_nums,
                                       self.trigger_label_stoi)
 
-        # 
+        #
         # batch_graphs = [{'entity': entities[i], 'trigger': triggers[i]} for i in range(len(entities))]
 
         return entities, triggers
