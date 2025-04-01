@@ -14,7 +14,7 @@ from collections import Counter, namedtuple, defaultdict
 from data import Batch, Instance
 from torch.nn.parameter import Parameter
 from sparsemax import Sparsemax
-import traceback # 用于更详细的错误追踪
+import traceback 
 from http import HTTPStatus
 import dashscope
 import math
